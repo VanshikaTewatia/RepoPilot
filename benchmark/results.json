@@ -1,0 +1,65 @@
+{
+  "total_tasks": 5,
+  "pass_at_1_rate": 20.0,
+  "pass_at_3_rate": 40.0,
+  "retrieval_success_rate": 100.0,
+  "average_attempts": 2.4,
+  "average_duration_seconds": 4.71,
+  "tasks": [
+    {
+      "task_id": "task-1-vip-discount",
+      "title": "Fix VIP discount to apply to order subtotal",
+      "target_file": "src/ecommerce/order_service.py",
+      "retrieval_success": true,
+      "pass_at_1": false,
+      "pass_at_3": true,
+      "attempts": 2,
+      "is_verified": true,
+      "duration_seconds": 3.476
+    },
+    {
+      "task_id": "task-2-cancel-idempotency",
+      "title": "Enforce cancel_order idempotency",
+      "target_file": "src/ecommerce/order_service.py",
+      "retrieval_success": true,
+      "pass_at_1": false,
+      "pass_at_3": false,
+      "attempts": 3,
+      "is_verified": false,
+      "duration_seconds": 4.421
+    },
+    {
+      "task_id": "task-3-payment-expiry-range",
+      "title": "Validate card expiry month range",
+      "target_file": "src/ecommerce/payment_validator.py",
+      "retrieval_success": true,
+      "pass_at_1": true,
+      "pass_at_3": true,
+      "attempts": 1,
+      "is_verified": true,
+      "duration_seconds": 2.242
+    },
+    {
+      "task_id": "task-4-stock-reservation",
+      "title": "Verify item stock reservation during order creation",
+      "target_file": "src/ecommerce/order_service.py",
+      "retrieval_success": true,
+      "pass_at_1": false,
+      "pass_at_3": false,
+      "attempts": 3,
+      "is_verified": false,
+      "duration_seconds": 7.317
+    },
+    {
+      "task_id": "task-5-tax-computation",
+      "title": "Verify tax calculation on discounted amount",
+      "target_file": "src/ecommerce/order_service.py",
+      "retrieval_success": true,
+      "pass_at_1": false,
+      "pass_at_3": false,
+      "attempts": 3,
+      "is_verified": false,
+      "duration_seconds": 6.113
+    }
+  ]
+}

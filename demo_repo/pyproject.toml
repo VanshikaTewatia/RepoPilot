@@ -1,0 +1,9 @@
+[project]
+name = "ecommerce-service"
+version = "0.1.0"
+description = "Demo e-commerce domain service for RepoPilot testing"
+dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
