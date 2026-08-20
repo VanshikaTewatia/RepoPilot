@@ -28,21 +28,12 @@ class OrderService:
         return self.calculate_order_total(order)
 
     def calculate_order_total(self, order: Order) -> Order:
-        """Calculate subtotal, VIP discounts, tax, and final amount.
-
-        BUG 1 (Deliberate): VIP discount calculation applies discount to the first item unit price
-        instead of applying 15% across the entire order subtotal.
-        """
+        """Calculate subtotal, VIP discounts, tax, and final amount."""
         subtotal = sum(line.line_total for line in order.lines)
         order.subtotal = round(subtotal, 2)
 
-        # BUG: Incorrect VIP discount computation
         if order.customer.is_vip:
-            # Flawed logic: calculates 15% of first item's unit price rather than subtotal
-            if order.lines:
-                order.discount_amount = round(order.lines[0].item.unit_price * self.VIP_DISCOUNT_PERCENT, 2)
-            else:
-                order.discount_amount = 0.0
+            order.discount_amount = round(order.subtotal * self.VIP_DISCOUNT_PERCENT, 2)
         else:
             order.discount_amount = 0.0
 

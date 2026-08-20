@@ -131,6 +131,14 @@ def apply_patch(
             lines = f.readlines()
 
         if start_line is not None and end_line is not None:
+            # Validate line bounds
+            if start_line < 1 or end_line < start_line or start_line > len(lines) + 1:
+                return {
+                    "success": False,
+                    "error": f"Invalid line range {start_line}-{end_line} for file '{file_path}' containing {len(lines)} lines.",
+                    "file_path": file_path,
+                }
+
             # Replace line range
             s_idx = max(0, start_line - 1)
             e_idx = min(len(lines), end_line)

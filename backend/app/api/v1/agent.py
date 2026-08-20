@@ -18,12 +18,14 @@ class CreateTaskRequest(BaseModel):
     repository_id: int
     title: str = Field(..., example="Fix null pointer exception in auth handler")
     description: str = Field(..., example="When user is not found, get_user returns None causing crash")
+    test_target: Optional[str] = Field(default=None, example="tests/test_auth.py::test_user_not_found")
     max_attempts: int = Field(default=3, ge=1, le=5)
 
 
 class FixBugRequest(BaseModel):
     repository_id: int
     issue_description: str = Field(..., example="Fix division by zero when denominator is 0 in calculator")
+    test_target: Optional[str] = Field(default=None, example="tests/test_calculator.py::test_zero_div")
     max_attempts: int = Field(default=3, ge=1, le=5)
 
 
@@ -78,6 +80,7 @@ async def create_and_run_task(
         "repository_id": repo.id,
         "workspace_dir": repo.local_path,
         "task_description": task.description,
+        "test_target": payload.test_target,
         "status": "pending",
         "attempt_count": 0,
         "max_attempts": payload.max_attempts,
@@ -119,6 +122,7 @@ async def fix_bug_endpoint(
         repository_id=payload.repository_id,
         title=payload.issue_description[:60],
         description=payload.issue_description,
+        test_target=payload.test_target,
         max_attempts=payload.max_attempts,
     )
     return await create_and_run_task(create_req, db)
