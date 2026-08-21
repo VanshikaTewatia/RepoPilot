@@ -1,7 +1,7 @@
 """SQLAlchemy model for agent investigation and repair tasks."""
 
 from typing import TYPE_CHECKING, List, Optional
-from sqlalchemy import ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base, TimestampMixin
@@ -29,11 +29,16 @@ class Task(Base, TimestampMixin):
         default="pending",
         nullable=False,
         index=True,
-    )  # pending, investigating, planning, editing, testing, approved, completed, failed
+    )  # pending, investigating, planning, editing, testing, human_approval_required, approved, rejected, completed, failed
     attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     patch_content: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     test_output: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     pr_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    # Isolated workspace copy holding the agent's changes while the task
+    # awaits human review. Null when no workspace is active.
+    workspace_path: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    # Files changed by the agent (relative paths), persisted at review time.
+    changed_files: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
 
     # Relationships
     repository: Mapped["Repository"] = relationship(

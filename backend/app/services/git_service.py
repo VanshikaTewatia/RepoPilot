@@ -1,6 +1,7 @@
 """Git workspace and diff generation service."""
 
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import List, Optional, Tuple
 import git
@@ -142,4 +143,77 @@ class GitService:
             except Exception:
                 return []
         finally:
+            GitService._close_repo(repo)
+
+    @staticmethod
+    def stage_all_changes(workspace_dir: Path | str) -> bool:
+        """Stage all changes (including new files) in a workspace git repository.
+
+        Staging makes new files appear as proper, applicable diff hunks in
+        `git diff HEAD` output instead of an untracked-file listing.
+        """
+        workspace = Path(workspace_dir).resolve()
+        if not workspace.is_dir():
+            return False
+
+        repo = None
+        try:
+            repo = git.Repo(workspace, search_parent_directories=True)
+            repo.git.add(A=True)
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to stage changes in '{workspace}': {e}")
+            return False
+        finally:
+            GitService._close_repo(repo)
+
+    @staticmethod
+    def apply_diff(target_dir: Path | str, diff_text: str) -> Tuple[bool, str]:
+        """Safely apply a unified diff to a git repository working tree.
+
+        Runs `git apply --check` first so the patch is only applied when it
+        fits the current state of the target without overwriting unrelated
+        changes. Never uses fuzzy matching.
+
+        Returns (success, error_output).
+        """
+        if not diff_text or not diff_text.strip():
+            return False, "Empty diff"
+
+        target = Path(target_dir).resolve()
+        if not target.is_dir():
+            return False, f"Target directory does not exist: {target}"
+
+        repo = None
+        tmp_path: Optional[str] = None
+        try:
+            repo = git.Repo(target, search_parent_directories=True)
+
+            # Write patch to a temp file with exact line endings; newline=""
+            # prevents Windows CRLF translation from corrupting the patch.
+            # A trailing newline is required or git apply reports the patch
+            # as corrupt at its final line.
+            patch_text = diff_text if diff_text.endswith("\n") else diff_text + "\n"
+            with tempfile.NamedTemporaryFile(
+                "w", suffix=".patch", delete=False, encoding="utf-8", newline=""
+            ) as tmp:
+                tmp.write(patch_text)
+                tmp_path = tmp.name
+
+            repo.git.apply("--check", tmp_path)
+            repo.git.apply(tmp_path)
+            return True, ""
+        except git.GitCommandError as e:
+            stderr = (e.stderr or "").strip() or str(e)
+            logger.warning(f"git apply failed against '{target}': {stderr}")
+            return False, stderr
+        except Exception as e:
+            logger.warning(f"Failed to apply diff to '{target}': {e}")
+            return False, str(e)
+        finally:
+            if tmp_path:
+                try:
+                    Path(tmp_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
             GitService._close_repo(repo)
