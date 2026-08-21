@@ -11,6 +11,8 @@ downloads/
 eggs/
 .eggs/
 lib/
+!frontend/lib/
+!frontend/lib/api.ts
 lib64/
 parts/
 sdist/
@@ -61,3 +63,6 @@ postgres_data/
 *.so
 *.dylib
 *.dll
+
+frontend/node_modules/
+frontend/.next/
