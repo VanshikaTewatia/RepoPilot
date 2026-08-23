@@ -136,7 +136,17 @@ def _generate_patches_with_gemini(
         "  }\n"
         "]\n"
         "If replacing the whole file, omit start_line and end_line or set them to null. "
-        "Otherwise specify 1-based start_line and end_line inclusive based on the EXACT lines provided in the context."
+        "Otherwise specify 1-based start_line and end_line inclusive based on the EXACT lines provided in the context.\n"
+        "\n"
+        "Strict minimality requirements:\n"
+        "- Modify only files that are necessary to satisfy the requested task.\n"
+        "- Make the smallest possible code change that fixes the issue.\n"
+        "- Do not refactor unrelated code.\n"
+        "- Do not rewrite docstrings or comments unless the task requires it.\n"
+        "- Do not add unrelated improvements, cleanup, or extra features.\n"
+        "- Do not modify behavior unrelated to the task.\n"
+        "- Prefer targeted line replacements (start_line/end_line) over whole-file replacement.\n"
+        "- If the requested behavior is already correctly implemented, return an empty array: []"
     )
 
     prompt = (
@@ -161,6 +171,26 @@ def _generate_patches_with_gemini(
     except Exception as e:
         logger.error(f"Error generating patches with Gemini: {e}")
         return []
+
+
+def _rank_candidate_files(files: List[str], keyword_matches: List[Dict[str, Any]]) -> List[str]:
+    """Rank candidate files for retrieval using investigation keyword matches.
+
+    Files with keyword matches rank first, ordered by descending match count;
+    ties (and files with no matches) keep deterministic alphabetical order.
+    """
+    match_counts: Dict[str, int] = {}
+    for match in keyword_matches:
+        file_path = match.get("file") if isinstance(match, dict) else None
+        if isinstance(file_path, str) and file_path:
+            match_counts[file_path] = match_counts.get(file_path, 0) + 1
+
+    matched = sorted(
+        (f for f in files if f in match_counts),
+        key=lambda f: (-match_counts[f], f),
+    )
+    unmatched = sorted(f for f in files if f not in match_counts)
+    return matched + unmatched
 
 
 def investigate_node(state: AgentState) -> Dict[str, Any]:
@@ -189,6 +219,7 @@ def investigate_node(state: AgentState) -> Dict[str, Any]:
     res_dict: Dict[str, Any] = {
         "status": "investigating",
         "investigation_findings": findings,
+        "keyword_matches": matches,
         "messages": state.get("messages", []) + [{"role": "agent", "content": findings}],
     }
     if test_target:
@@ -197,14 +228,23 @@ def investigate_node(state: AgentState) -> Dict[str, Any]:
     return res_dict
 
 
+RETRIEVAL_LIMIT = 5
+
+
 def retrieve_node(state: AgentState) -> Dict[str, Any]:
-    """Retrieve fresh code context directly from the workspace on disk."""
+    """Retrieve fresh code context directly from the workspace on disk.
+
+    Candidate files are ranked so those with investigation keyword matches are
+    retrieved first instead of relying on alphabetical order alone.
+    """
     workspace = state["workspace_dir"]
     file_list = tools.list_files(workspace)
     files = file_list.get("files", [])
 
+    ranked_files = _rank_candidate_files(files, state.get("keyword_matches") or [])[:RETRIEVAL_LIMIT]
+
     retrieved: List[Dict[str, Any]] = []
-    for f in files[:5]:
+    for f in ranked_files:
         content_res = tools.read_file(workspace, f)
         if content_res.get("success"):
             retrieved.append({

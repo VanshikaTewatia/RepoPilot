@@ -6,6 +6,7 @@ import {
   Task,
   TaskDiff,
   approveTask,
+  getTask,
   getTaskDiff,
   isApiError,
   rejectTask,
@@ -43,9 +44,39 @@ export default function ReviewPanel({ task, onReviewed }: ReviewPanelProps) {
   const [isLoadingDiff, setIsLoadingDiff] = useState(true);
   const [diffError, setDiffError] = useState<string | null>(null);
 
+  // Authoritative task refresh: the prop snapshot can be stale (e.g. missing
+  // test_output), so the task is re-fetched from the server on mount.
+  const [refreshedTask, setRefreshedTask] = useState<Task | null>(null);
+  const [isLoadingTask, setIsLoadingTask] = useState(true);
+  const [taskLoadError, setTaskLoadError] = useState<string | null>(null);
+
   const [conflictMessage, setConflictMessage] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [acting, setActing] = useState<"approve" | "reject" | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setIsLoadingTask(true);
+    setTaskLoadError(null);
+    getTask(task.id)
+      .then((fresh) => {
+        if (!cancelled) setRefreshedTask(fresh);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setTaskLoadError(
+            isApiError(err) ? err.detail : "Failed to load task details."
+          );
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setIsLoadingTask(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [task.id]);
+
 
   const loadDiff = useCallback(async () => {
     setIsLoadingDiff(true);
@@ -118,13 +149,18 @@ export default function ReviewPanel({ task, onReviewed }: ReviewPanelProps) {
     diffLines.pop();
   }
 
+  // Server-fetched task data wins once loaded; fall back to the prop snapshot
+  // while loading or if the refresh failed.
+  const currentTask = refreshedTask ?? task;
+  const isPendingReview = currentTask.status === "human_approval_required";
+
   return (
     <div className="space-y-4 border border-amber-900/60 rounded-xl p-5 bg-amber-950/10">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <h3 className="font-semibold text-amber-200">
           Review Generated Changes
         </h3>
-        <StatusBadge status={task.status} size="sm" />
+        <StatusBadge status={currentTask.status} size="sm" />
       </div>
 
       <p className="text-sm text-slate-300">
@@ -132,6 +168,18 @@ export default function ReviewPanel({ task, onReviewed }: ReviewPanelProps) {
         workspace. Your original repository has not been modified yet — approve
         to apply the patch, or reject to discard it.
       </p>
+
+      {isLoadingTask && (
+        <p className="text-xs text-slate-500 animate-pulse">
+          Refreshing task details...
+        </p>
+      )}
+      {taskLoadError && (
+        <p className="text-xs text-amber-400/80">
+          Could not refresh task details ({taskLoadError}). Showing cached
+          details instead.
+        </p>
+      )}
 
       {/* Conflict banner (HTTP 409 from approve) */}
       {conflictMessage && (
@@ -212,34 +260,41 @@ export default function ReviewPanel({ task, onReviewed }: ReviewPanelProps) {
           </div>
 
           {/* Sandbox test output (collapsible) */}
-          {task.test_output && (
+          {currentTask.test_output && (
             <details className="bg-slate-950 border border-slate-800 rounded-lg overflow-hidden">
               <summary className="cursor-pointer select-none px-4 py-3 text-xs font-semibold text-slate-400 uppercase tracking-wide hover:text-slate-200">
                 Sandbox Test Output
               </summary>
               <pre className="px-4 pb-4 text-xs text-slate-300 overflow-x-auto max-h-64 font-mono whitespace-pre-wrap">
-                {task.test_output}
+                {currentTask.test_output}
               </pre>
             </details>
           )}
 
           {/* Actions */}
-          <div className="flex flex-col sm:flex-row gap-3 pt-1">
-            <button
-              onClick={handleApprove}
-              disabled={acting !== null}
-              className="flex-1 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-semibold px-6 py-2.5 rounded-lg transition"
-            >
-              {acting === "approve" ? "Applying patch..." : "Approve & Apply"}
-            </button>
-            <button
-              onClick={handleReject}
-              disabled={acting !== null}
-              className="flex-1 bg-rose-700 hover:bg-rose-600 disabled:opacity-50 text-white font-semibold px-6 py-2.5 rounded-lg transition"
-            >
-              {acting === "reject" ? "Rejecting..." : "Reject Fix"}
-            </button>
-          </div>
+          {isPendingReview ? (
+            <div className="flex flex-col sm:flex-row gap-3 pt-1">
+              <button
+                onClick={handleApprove}
+                disabled={acting !== null}
+                className="flex-1 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-semibold px-6 py-2.5 rounded-lg transition"
+              >
+                {acting === "approve" ? "Applying patch..." : "Approve & Apply"}
+              </button>
+              <button
+                onClick={handleReject}
+                disabled={acting !== null}
+                className="flex-1 bg-rose-700 hover:bg-rose-600 disabled:opacity-50 text-white font-semibold px-6 py-2.5 rounded-lg transition"
+              >
+                {acting === "reject" ? "Rejecting..." : "Reject Fix"}
+              </button>
+            </div>
+          ) : (
+            <p className="text-sm text-slate-400 pt-1">
+              This task is no longer pending review (status:{" "}
+              <span className="font-mono">{currentTask.status}</span>).
+            </p>
+          )}
         </>
       )}
     </div>

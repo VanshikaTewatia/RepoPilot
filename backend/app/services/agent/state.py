@@ -16,6 +16,7 @@ class AgentState(TypedDict, total=False):
     max_attempts: int
     test_target: Optional[str]
     investigation_findings: str
+    keyword_matches: List[Dict[str, Any]]
     retrieved_context: List[Dict[str, Any]]
     repair_plan: str
     proposed_patches: List[Dict[str, Any]]

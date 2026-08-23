@@ -10,8 +10,11 @@ from app.services.agent.graph import (
     agent_app,
     plan_node,
     edit_node,
+    investigate_node,
+    retrieve_node,
     validate_patch,
     parse_and_validate_patches,
+    _generate_patches_with_gemini,
 )
 
 
@@ -376,3 +379,135 @@ async def test_task_specific_test_target_isolation():
         assert final_state["is_verified"] is True
         assert final_state["attempt_count"] == 1
         assert final_state["status"] == "verified"
+
+
+# -------------------------------------------------------------------------
+# Focused retrieval ranking (Task #6 follow-up)
+# -------------------------------------------------------------------------
+def _make_ranking_workspace(tmpdir: str, files: dict) -> Path:
+    workspace = Path(tmpdir)
+    for name, content in files.items():
+        (workspace / name).write_text(content, encoding="utf-8")
+    return workspace
+
+
+def test_investigate_persists_keyword_matches():
+    """investigate_node must expose its keyword matches for retrieval ranking."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        workspace = _make_ranking_workspace(tmpdir, {"zzz_vip.py": "discount = 0.15\n"})
+        state = {"workspace_dir": str(workspace), "task_description": "Apply discount logic"}
+
+        out = investigate_node(state)
+
+        assert len(out["keyword_matches"]) == 1
+        assert out["keyword_matches"][0]["file"] == "zzz_vip.py"
+
+
+def test_retrieval_ranks_relevant_files_first():
+    """A relevant file must outrank alphabetically earlier irrelevant fillers."""
+    files = {
+        "a_alpha.py": "filler value\n",
+        "b_beta.py": "filler value\n",
+        "c_gamma.py": "filler value\n",
+        "d_delta.py": "filler value\n",
+        "e_epsilon.py": "filler value\n",
+        "zzz_vip.py": "discount = 0.15\n# cart discount applied\n",
+    }
+    with tempfile.TemporaryDirectory() as tmpdir:
+        workspace = _make_ranking_workspace(tmpdir, files)
+        state = {"workspace_dir": str(workspace), "task_description": "Apply discount to cart totals"}
+
+        inv = investigate_node(state)
+        assert inv["keyword_matches"], "expected investigation matches"
+
+        out = retrieve_node({**state, **inv})
+        retrieved_paths = [item["file_path"] for item in out["retrieved_context"]]
+
+        # Limit is still 5; the relevant file ranks first even though it sorts last
+        assert retrieved_paths[0] == "zzz_vip.py"
+        assert len(retrieved_paths) == 5
+        assert "e_epsilon.py" not in retrieved_paths
+
+
+def test_retrieval_ties_break_alphabetically():
+    """Equal match counts keep deterministic alphabetical ordering."""
+    files = {
+        "m_mid.py": "plain content\n",
+        "aaa_z.py": "widget here\n",
+        "zzz_a.py": "widget too\n",
+    }
+    with tempfile.TemporaryDirectory() as tmpdir:
+        workspace = _make_ranking_workspace(tmpdir, files)
+        state = {"workspace_dir": str(workspace), "task_description": "Add widget support"}
+
+        inv = investigate_node(state)
+        out = retrieve_node({**state, **inv})
+        retrieved_paths = [item["file_path"] for item in out["retrieved_context"]]
+
+        assert retrieved_paths == ["aaa_z.py", "zzz_a.py", "m_mid.py"]
+
+
+def test_retrieval_without_matches_keeps_alphabetical_order():
+    """No investigation data falls back to the previous alphabetical slice."""
+    files = {
+        "b_beta.py": "one\n",
+        "a_alpha.py": "two\n",
+        "c_gamma.py": "three\n",
+    }
+    with tempfile.TemporaryDirectory() as tmpdir:
+        workspace = _make_ranking_workspace(tmpdir, files)
+        state = {"workspace_dir": str(workspace)}  # no task_description/keyword_matches
+
+        out = retrieve_node(state)
+        retrieved_paths = [item["file_path"] for item in out["retrieved_context"]]
+
+        assert retrieved_paths == ["a_alpha.py", "b_beta.py", "c_gamma.py"]
+
+
+# -------------------------------------------------------------------------
+# Gemini minimality prompt requirements (Task #6 follow-up)
+# -------------------------------------------------------------------------
+def test_gemini_system_prompt_requires_minimality():
+    """The patch-generation prompt must enforce minimal, on-task changes."""
+    mock_response = MagicMock()
+    mock_response.text = json.dumps([
+        {
+            "file_path": "src/order_service.py",
+            "code": "        return order.subtotal * 0.15\n",
+            "start_line": 40,
+            "end_line": 42,
+        }
+    ])
+
+    captured = {}
+
+    def capture_generate_content(*args, **kwargs):
+        captured.update(kwargs)
+        return mock_response
+
+    mock_client = MagicMock()
+    mock_client.models.generate_content.side_effect = capture_generate_content
+
+    with patch("app.core.config.settings.gemini_api_key", "real_like_test_key_12345"):
+        with patch("google.genai.Client", return_value=mock_client):
+            patches = _generate_patches_with_gemini(
+                task_description="Fix VIP discount calculation",
+                retrieved_context=[
+                    {"file_path": "src/order_service.py", "content": "def f():\n    pass\n", "total_lines": 50}
+                ],
+            )
+
+    instruction = captured["config"]["system_instruction"]
+    assert "Modify only files that are necessary" in instruction
+    assert "smallest possible code change" in instruction
+    assert "Do not refactor unrelated code." in instruction
+    assert "Do not rewrite docstrings or comments unless the task requires it." in instruction
+    assert "Do not add unrelated improvements" in instruction
+    assert "Do not modify behavior unrelated to the task." in instruction
+    assert "Prefer targeted line replacements" in instruction
+    assert "return an empty array: []" in instruction
+
+    # Existing parsing/validation behavior is intact
+    assert len(patches) == 1
+    assert patches[0]["file_path"] == "src/order_service.py"
+    assert patches[0]["start_line"] == 40

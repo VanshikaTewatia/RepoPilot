@@ -54,6 +54,16 @@ EXCLUDED_FILE_PATTERNS: Set[str] = {
     ".DS_Store",
 }
 
+# Patterns written into every workspace .gitignore before its baseline commit so
+# runtime-generated Python/test artifacts (e.g. bytecode written by pytest inside
+# the sandbox) can never be staged into the task's persisted review diff.
+WORKSPACE_GITIGNORE_PATTERNS: List[str] = [
+    "__pycache__/",
+    "*.pyc",
+    ".pytest_cache/",
+    ".coverage",
+]
+
 
 def _make_copy_ignore_filter() -> Callable[[str, List[str]], Set[str]]:
     """Build a shutil.copytree ignore callable based on exclusion rules."""
@@ -125,6 +135,13 @@ class WorkspaceManager:
     @staticmethod
     def _init_baseline_git_repo(workspace: Path, task_id: Union[int, str]) -> None:
         """Initialize a Git repository in the workspace with a baseline commit."""
+        # The .gitignore is written before the baseline commit so it is itself
+        # tracked and keeps runtime artifacts out of every later diff.
+        gitignore_path = workspace / ".gitignore"
+        gitignore_path.write_text(
+            "\n".join(WORKSPACE_GITIGNORE_PATTERNS) + "\n", encoding="utf-8"
+        )
+
         repo = git.Repo.init(workspace)
         try:
             # Local identity so commits work without global git config.

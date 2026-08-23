@@ -1,5 +1,8 @@
 """Git workspace and diff generation service."""
 
+import fnmatch
+import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -7,6 +10,12 @@ from typing import List, Optional, Tuple
 import git
 
 from app.core.logging import logger
+
+# Runtime-generated Python/test artifacts. These are pruned from a workspace
+# before staging so they can never enter the persisted review diff, even for
+# workspaces created before per-workspace .gitignore files existed.
+ARTIFACT_DIR_NAMES = {"__pycache__", ".pytest_cache"}
+ARTIFACT_FILE_PATTERNS = {"*.pyc", "*.pyo", ".coverage"}
 
 
 class GitService:
@@ -146,15 +155,43 @@ class GitService:
             GitService._close_repo(repo)
 
     @staticmethod
+    def _prune_runtime_artifacts(workspace_dir: Path) -> None:
+        """Delete pytest/bytecode artifacts from the workspace on disk.
+
+        Test runs generate __pycache__ directories, .pyc files, .pytest_cache,
+        and .coverage inside the workspace. Pruning them before staging keeps
+        generated artifacts out of `git add -A` and therefore out of the task
+        diff, regardless of any .gitignore present.
+        """
+        root = Path(workspace_dir)
+        if not root.is_dir():
+            return
+
+        for dirpath, dirnames, filenames in os.walk(root):
+            for name in list(dirnames):
+                if name in ARTIFACT_DIR_NAMES:
+                    shutil.rmtree(Path(dirpath) / name, ignore_errors=True)
+                    dirnames.remove(name)
+            for name in filenames:
+                if any(fnmatch.fnmatch(name, pattern) for pattern in ARTIFACT_FILE_PATTERNS):
+                    try:
+                        (Path(dirpath) / name).unlink()
+                    except OSError as e:
+                        logger.warning(f"Could not prune artifact '{dirpath / name}': {e}")
+
+    @staticmethod
     def stage_all_changes(workspace_dir: Path | str) -> bool:
         """Stage all changes (including new files) in a workspace git repository.
 
         Staging makes new files appear as proper, applicable diff hunks in
-        `git diff HEAD` output instead of an untracked-file listing.
+        `git diff HEAD` output instead of an untracked-file listing. Generated
+        runtime artifacts are pruned first so they are never staged.
         """
         workspace = Path(workspace_dir).resolve()
         if not workspace.is_dir():
             return False
+
+        GitService._prune_runtime_artifacts(workspace)
 
         repo = None
         try:
