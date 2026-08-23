@@ -1,5 +1,6 @@
 """LangGraph agent task execution, diff inspection, and approval routes."""
 
+import asyncio
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, status
@@ -7,14 +8,21 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from app.api.deps import SessionDep
+from app.core.config import settings
 from app.core.logging import logger
 from app.db.models.repository import Repository
 from app.db.models.task import Task
 from app.services.agent.graph import agent_app
+from app.services.agent import tools
 from app.services.git_service import GitService
+from app.services.github_service import GitHubError, GitHubService, is_github_url, parse_github_url
 from app.services.workspace_manager import WorkspaceManager
 
 router = APIRouter(prefix="/tasks", tags=["Agent Tasks"])
+
+# Branch created in the ORIGINAL repository (never in the isolated workspace)
+# for a GitHub-backed task once its patch is approved.
+TASK_BRANCH_PREFIX = "repopilot/task-"
 
 
 class CreateTaskRequest(BaseModel):
@@ -55,6 +63,7 @@ class TaskReviewResponse(BaseModel):
     task_id: int
     status: str
     message: str
+    pr_url: Optional[str] = None
 
 
 @router.post("", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
@@ -203,23 +212,139 @@ async def get_task_diff(task_id: int, db: SessionDep) -> Dict[str, Any]:
     }
 
 
+def _rollback_task_branch(repo_local_path: str, default_branch: str, branch_name: str) -> None:
+    """Best-effort: restore the original repository's working tree after a
+    failed GitHub approval step, so it stays clean for the next task's
+    WorkspaceManager.create_workspace copy. Never raises."""
+    try:
+        GitService.checkout(repo_local_path, default_branch, force=True)
+        GitService.delete_branch(repo_local_path, branch_name)
+    except Exception as e:
+        logger.warning(f"Failed to roll back task branch '{branch_name}' in '{repo_local_path}': {e}")
+
+
+async def _approve_github_task(task: Task, repo: Repository, db: SessionDep) -> Dict[str, Any]:
+    """Approval flow for a GitHub-backed repository: branch, apply, verify,
+    commit, push, and open a Pull Request against the original repository.
+
+    The original repository's working tree is used directly (not the isolated
+    workspace) for the branch/commit/push, exactly as the existing local-apply
+    flow already does for `git apply` -- only now on a dedicated task branch
+    instead of the currently checked-out branch. On any failure the branch is
+    rolled back and the working tree is restored to `default_branch` so a
+    later retry (or another task) starts from a clean state.
+    """
+    owner, repo_name = parse_github_url(repo.remote_url)
+    branch_name = f"{TASK_BRANCH_PREFIX}{task.id}"
+    github = GitHubService(api_base_url=settings.github_api_base_url)
+    token = settings.github_token or None
+    clone_url = f"https://github.com/{owner}/{repo_name}.git"
+
+    try:
+        GitService.create_branch(repo.local_path, branch_name, repo.default_branch)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Could not create task branch from '{repo.default_branch}': {e}",
+        )
+
+    applied, apply_error = GitService.apply_diff(repo.local_path, task.patch_content)
+    if not applied:
+        _rollback_task_branch(repo.local_path, repo.default_branch, branch_name)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Patch cannot be applied cleanly to the current repository state: {apply_error}",
+        )
+
+    # Final verification on the real target branch before it is ever pushed.
+    test_res = await asyncio.to_thread(tools.run_tests, repo.local_path, None)
+    if not test_res.get("success", False):
+        _rollback_task_branch(repo.local_path, repo.default_branch, branch_name)
+        task.status = "approval_failed"
+        task.test_output = (
+            f"{task.test_output or ''}\n\n[Approval verification failed]\n"
+            f"{test_res.get('output', 'No test output')}"
+        ).strip()
+        await db.commit()
+        await db.refresh(task)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Final verification failed on the target branch; the fix was not pushed. "
+            "The task remains reviewable and can be retried.",
+        )
+
+    GitService.commit_all(repo.local_path, f"RepoPilot: {task.title}\n\n{task.description}")
+
+    try:
+        await asyncio.to_thread(github.push_branch, repo.local_path, branch_name, clone_url, token)
+        pr = await asyncio.to_thread(
+            github.create_pull_request,
+            owner,
+            repo_name,
+            branch_name,
+            repo.default_branch,
+            task.title,
+            f"Automated fix generated by RepoPilot.\n\n**Task:** {task.description}\n\n"
+            f"Verified with {test_res.get('passed', 0)} passing test(s) in an isolated sandbox "
+            "before this Pull Request was opened.",
+            token,
+        )
+    except GitHubError as e:
+        _rollback_task_branch(repo.local_path, repo.default_branch, branch_name)
+        task.status = "approval_failed"
+        task.test_output = f"{task.test_output or ''}\n\n[Push/PR failed] {e}".strip()
+        await db.commit()
+        await db.refresh(task)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e))
+
+    task.status = "approved"
+    task.pr_url = pr.get("url")
+
+    GitService.checkout(repo.local_path, repo.default_branch, force=True)
+    if task.workspace_path:
+        try:
+            WorkspaceManager().cleanup_workspace(task.workspace_path)
+            task.workspace_path = None
+        except Exception as e:
+            logger.warning(f"Failed to clean up workspace '{task.workspace_path}': {e}")
+
+    await db.commit()
+    await db.refresh(task)
+
+    return {
+        "task_id": task.id,
+        "status": "approved",
+        "message": "Patch pushed to a new branch and a Pull Request was created.",
+        "pr_url": task.pr_url,
+    }
+
+
 @router.post("/{task_id}/approve", response_model=TaskReviewResponse)
 async def approve_task_fix(task_id: int, db: SessionDep) -> Dict[str, Any]:
     """Apply the stored patch to the original repository after human approval.
 
-    The stored diff is applied safely (`git apply --check` first): if it no
-    longer fits the current repository state, a conflict is returned, the task
-    stays pending review, and the isolated workspace is preserved.
+    For a local-path repository, the stored diff is applied directly (`git
+    apply --check` first): if it no longer fits the current repository state,
+    a conflict is returned, the task stays pending review, and the isolated
+    workspace is preserved.
+
+    For a GitHub-backed repository (`repository.remote_url` is a github.com
+    URL), the same verified patch is instead applied to a new branch, tested
+    once more, committed, pushed, and opened as a Pull Request -- see
+    `_approve_github_task`. A retry is allowed from `approval_failed` in
+    addition to `human_approval_required` so a transient push/PR failure
+    doesn't strand the task.
     """
     result = await db.execute(select(Task).where(Task.id == task_id))
     task = result.scalar_one_or_none()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    if task.status != "human_approval_required":
+    if task.status not in ("human_approval_required", "approval_failed"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Task with status '{task.status}' cannot be approved (must be 'human_approval_required')",
+            detail=f"Task with status '{task.status}' cannot be approved "
+            "(must be 'human_approval_required' or 'approval_failed')",
         )
 
     repo_res = await db.execute(select(Repository).where(Repository.id == task.repository_id))
@@ -238,7 +363,10 @@ async def approve_task_fix(task_id: int, db: SessionDep) -> Dict[str, Any]:
             detail=f"Original repository path is not accessible: {repo.local_path}",
         )
 
-    # Apply the persisted diff to the ORIGINAL repository. The isolated
+    if is_github_url(repo.remote_url):
+        return await _approve_github_task(task, repo, db)
+
+    # Local-path repository: apply the persisted diff directly. The isolated
     # workspace is never used as an apply target or file source.
     applied, error = GitService.apply_diff(repo.local_path, task.patch_content)
     if not applied:

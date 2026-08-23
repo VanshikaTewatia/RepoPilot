@@ -107,7 +107,8 @@ export default function Home() {
         </h1>
         <p className="text-slate-400 mt-1">
           Autonomous AI Software Engineer — isolated workspaces, sandboxed
-          testing & human-approved patches.
+          testing, human-approved patches, and automatic Pull Requests for
+          GitHub-connected repositories.
         </p>
       </header>
 
@@ -207,10 +208,14 @@ export default function Home() {
           </p>
         )}
 
-        {/* Step C: human review of generated changes */}
-        {task && task.status === "human_approval_required" && (
-          <ReviewPanel task={task} onReviewed={handleReviewed} />
-        )}
+        {/* Step C: human review of generated changes (also re-shown after a
+            push/PR failure so the verified fix can be retried without
+            re-running the agent) */}
+        {task &&
+          (task.status === "human_approval_required" ||
+            task.status === "approval_failed") && (
+            <ReviewPanel task={task} onReviewed={handleReviewed} />
+          )}
 
         {/* Step D: final outcome */}
         {task && TERMINAL_STATUSES.has(task.status) && (
@@ -231,7 +236,9 @@ export default function Home() {
 
       <footer className="text-center text-xs text-slate-600 pb-4">
         RepoPilot runs every task inside an isolated copy of your repository —
-        the original code is only modified when you approve a fix.
+        the original code is only modified (and, for GitHub repositories,
+        only branched, pushed, and opened as a Pull Request) once you approve
+        a fix.
       </footer>
     </main>
   );

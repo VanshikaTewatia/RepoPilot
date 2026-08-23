@@ -106,6 +106,10 @@ class Settings(BaseSettings):
         default="",
         description="GitHub Personal Access Token for repo cloning and PR creation",
     )
+    github_api_base_url: str = Field(
+        default="https://api.github.com",
+        description="GitHub REST API base URL (overridable in tests to point at a mock server)",
+    )
 
     # -------------------------------------------------------------------------
     # Workspace & Docker Sandbox Execution

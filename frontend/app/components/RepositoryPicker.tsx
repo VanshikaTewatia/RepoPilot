@@ -6,12 +6,14 @@ import {
   IndexResult,
   Repository,
   createRepository,
+  createRepositoryFromGitHub,
   indexRepository,
   isApiError,
   listRepositories,
 } from "@/lib/api";
 
 const DEFAULT_NEW_REPO_PATH = "C:/Users/Lakshay/RepoPilot/demo_repo";
+type RegisterMode = "github" | "local";
 
 interface RepositoryPickerProps {
   selectedRepo: Repository | null;
@@ -32,8 +34,11 @@ export default function RepositoryPicker({
   const [listError, setListError] = useState<string | null>(null);
 
   const [showRegister, setShowRegister] = useState(false);
+  const [registerMode, setRegisterMode] = useState<RegisterMode>("github");
   const [newPath, setNewPath] = useState(DEFAULT_NEW_REPO_PATH);
   const [newName, setNewName] = useState("");
+  const [githubUrl, setGithubUrl] = useState("");
+  const [githubBranch, setGithubBranch] = useState("");
   const [isRegistering, setIsRegistering] = useState(false);
   const [registerError, setRegisterError] = useState<string | null>(null);
 
@@ -66,6 +71,38 @@ export default function RepositoryPicker({
       onSelect(repos[0]);
     }
   }, [repos, selectedRepo, onSelect]);
+
+  const handleRegisterGithub = async () => {
+    const trimmedUrl = githubUrl.trim();
+    if (!trimmedUrl) {
+      setRegisterError("Please enter a GitHub repository URL.");
+      return;
+    }
+
+    setIsRegistering(true);
+    setRegisterError(null);
+    try {
+      const repo = await createRepositoryFromGitHub({
+        url: trimmedUrl,
+        name: newName.trim() || undefined,
+        default_branch: githubBranch.trim() || undefined,
+      });
+      setRepos((prev) => [repo, ...prev]);
+      onSelect(repo);
+      setShowRegister(false);
+      setGithubUrl("");
+      setGithubBranch("");
+      setNewName("");
+      setIndexMessage(`Cloned "${repo.name}" (#${repo.id}) from GitHub. Ready to index.`);
+      setIndexIsError(false);
+    } catch (err) {
+      setRegisterError(
+        isApiError(err) ? err.detail : "Failed to connect the GitHub repository."
+      );
+    } finally {
+      setIsRegistering(false);
+    }
+  };
 
   const handleRegister = async () => {
     const trimmedPath = newPath.trim();
@@ -180,7 +217,7 @@ export default function RepositoryPicker({
           onClick={() => setShowRegister((v) => !v)}
           className="border border-slate-700 hover:border-slate-500 text-slate-300 font-medium px-4 py-2 rounded-lg transition whitespace-nowrap"
         >
-          {showRegister ? "Cancel" : "+ Register New"}
+          {showRegister ? "Cancel" : "+ Connect Repository"}
         </button>
       </div>
 
@@ -199,29 +236,94 @@ export default function RepositoryPicker({
       {/* Register new repository */}
       {showRegister && (
         <div className="bg-slate-950 border border-slate-800 rounded-lg p-4 space-y-3">
-          <div className="flex flex-col sm:flex-row gap-3">
-            <input
-              type="text"
-              className="flex-[2] bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-cyan-500"
-              value={newPath}
-              onChange={(e) => setNewPath(e.target.value)}
-              placeholder="Absolute local path (e.g. C:/Users/Lakshay/RepoPilot/demo_repo)"
-            />
-            <input
-              type="text"
-              className="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-cyan-500"
-              value={newName}
-              onChange={(e) => setNewName(e.target.value)}
-              placeholder="Display name (optional)"
-            />
+          {/* Mode toggle */}
+          <div className="inline-flex rounded-lg border border-slate-700 overflow-hidden text-xs font-medium">
             <button
-              onClick={handleRegister}
-              disabled={isRegistering}
-              className="bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-sm font-medium px-5 py-2 rounded-lg transition whitespace-nowrap"
+              onClick={() => {
+                setRegisterMode("github");
+                setRegisterError(null);
+              }}
+              className={`px-3 py-1.5 transition ${
+                registerMode === "github"
+                  ? "bg-cyan-600 text-white"
+                  : "bg-slate-900 text-slate-400 hover:text-slate-200"
+              }`}
             >
-              {isRegistering ? "Registering..." : "Register"}
+              GitHub URL
+            </button>
+            <button
+              onClick={() => {
+                setRegisterMode("local");
+                setRegisterError(null);
+              }}
+              className={`px-3 py-1.5 transition ${
+                registerMode === "local"
+                  ? "bg-cyan-600 text-white"
+                  : "bg-slate-900 text-slate-400 hover:text-slate-200"
+              }`}
+            >
+              Local Path
             </button>
           </div>
+
+          {registerMode === "github" ? (
+            <div className="space-y-2">
+              <div className="flex flex-col sm:flex-row gap-3">
+                <input
+                  type="text"
+                  className="flex-[2] bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-cyan-500"
+                  value={githubUrl}
+                  onChange={(e) => setGithubUrl(e.target.value)}
+                  placeholder="https://github.com/owner/repository"
+                />
+                <input
+                  type="text"
+                  className="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-cyan-500"
+                  value={githubBranch}
+                  onChange={(e) => setGithubBranch(e.target.value)}
+                  placeholder="Base branch (optional, defaults to repo default)"
+                />
+                <button
+                  onClick={handleRegisterGithub}
+                  disabled={isRegistering}
+                  className="bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-sm font-medium px-5 py-2 rounded-lg transition whitespace-nowrap"
+                >
+                  {isRegistering ? "Connecting..." : "Connect"}
+                </button>
+              </div>
+              <p className="text-[11px] text-slate-500">
+                Public repositories work with no configuration. Private repositories
+                require <code className="text-slate-400">GITHUB_TOKEN</code> configured
+                on the RepoPilot server — there is no token field here, and RepoPilot
+                never asks for or stores one.
+              </p>
+            </div>
+          ) : (
+            <div className="flex flex-col sm:flex-row gap-3">
+              <input
+                type="text"
+                className="flex-[2] bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-cyan-500"
+                value={newPath}
+                onChange={(e) => setNewPath(e.target.value)}
+                placeholder="Absolute local path (e.g. C:/Users/Lakshay/RepoPilot/demo_repo)"
+              />
+              <input
+                type="text"
+                className="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-cyan-500"
+                value={newName}
+                onChange={(e) => setNewName(e.target.value)}
+                placeholder="Display name (optional)"
+              />
+              <button
+                onClick={handleRegister}
+                disabled={isRegistering}
+                className="bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-sm font-medium px-5 py-2 rounded-lg transition whitespace-nowrap"
+              >
+                {isRegistering ? "Registering..." : "Register"}
+              </button>
+            </div>
+          )}
+
           {registerError && (
             <p className="text-xs text-red-400">{registerError}</p>
           )}

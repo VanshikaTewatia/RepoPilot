@@ -70,6 +70,7 @@ export interface TaskReviewResult {
   task_id: number;
   status: string;
   message: string;
+  pr_url?: string | null;
 }
 
 /**
@@ -154,6 +155,20 @@ export function createRepository(payload: {
 
 export function indexRepository(repoId: number): Promise<IndexResult> {
   return request<IndexResult>(`/repositories/${repoId}/index`, { method: "POST" });
+}
+
+/**
+ * Register a repository by cloning it from a public or (server-token-
+ * enabled) private GitHub URL. There is no token parameter here by design:
+ * GITHUB_TOKEN lives only in the backend's environment and is never accepted
+ * from the frontend.
+ */
+export function createRepositoryFromGitHub(payload: {
+  url: string;
+  name?: string;
+  default_branch?: string;
+}): Promise<Repository> {
+  return request<Repository>("/repositories/github", jsonInit("POST", payload));
 }
 
 // ---------------------------------------------------------------------------

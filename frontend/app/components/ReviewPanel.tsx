@@ -53,6 +53,7 @@ export default function ReviewPanel({ task, onReviewed }: ReviewPanelProps) {
   const [conflictMessage, setConflictMessage] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [acting, setActing] = useState<"approve" | "reject" | null>(null);
+  const [prUrl, setPrUrl] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -101,8 +102,10 @@ export default function ReviewPanel({ task, onReviewed }: ReviewPanelProps) {
     setActing("approve");
     setConflictMessage(null);
     setActionError(null);
+    setPrUrl(null);
     try {
       const result = await approveTask(task.id);
+      if (result.pr_url) setPrUrl(result.pr_url);
       onReviewed(result.status);
     } catch (err) {
       if (err instanceof ApiError && err.isConflict) {
@@ -113,6 +116,15 @@ export default function ReviewPanel({ task, onReviewed }: ReviewPanelProps) {
         setActionError(
           isApiError(err) ? err.detail : "Approval failed unexpectedly."
         );
+        // A push/PR failure (GitHub flow) moves the task to "approval_failed"
+        // server-side even though this request threw -- refresh so the badge
+        // and retry affordance reflect that instead of a stale status.
+        try {
+          const fresh = await getTask(task.id);
+          setRefreshedTask(fresh);
+        } catch {
+          // Best-effort only; the actionError message above already explains what happened.
+        }
       }
     } finally {
       setActing(null);
@@ -152,7 +164,10 @@ export default function ReviewPanel({ task, onReviewed }: ReviewPanelProps) {
   // Server-fetched task data wins once loaded; fall back to the prop snapshot
   // while loading or if the refresh failed.
   const currentTask = refreshedTask ?? task;
-  const isPendingReview = currentTask.status === "human_approval_required";
+  const isPendingReview =
+    currentTask.status === "human_approval_required" ||
+    currentTask.status === "approval_failed";
+  const resolvedPrUrl = prUrl ?? currentTask.pr_url ?? null;
 
   return (
     <div className="space-y-4 border border-amber-900/60 rounded-xl p-5 bg-amber-950/10">
@@ -166,8 +181,41 @@ export default function ReviewPanel({ task, onReviewed }: ReviewPanelProps) {
       <p className="text-sm text-slate-300">
         The agent verified this fix against the full test suite in an isolated
         workspace. Your original repository has not been modified yet — approve
-        to apply the patch, or reject to discard it.
+        to apply the patch (pushing a branch and opening a Pull Request for
+        GitHub-connected repositories), or reject to discard it.
       </p>
+
+      {currentTask.status === "approval_failed" && (
+        <div className="border border-orange-800 bg-orange-950/30 rounded-lg p-4 space-y-1">
+          <p className="text-sm font-semibold text-orange-300">
+            The verified fix could not be pushed / opened as a Pull Request.
+          </p>
+          <p className="text-xs text-slate-400">
+            The patch itself was verified and is unchanged — the isolated
+            workspace and stored diff are preserved. Your repository was
+            rolled back to its original branch with nothing partially
+            applied. Fix the underlying issue (e.g. configure{" "}
+            <code className="text-slate-300">GITHUB_TOKEN</code> on the
+            server) and press Approve again to retry.
+          </p>
+        </div>
+      )}
+
+      {resolvedPrUrl && (
+        <div className="border border-emerald-800 bg-emerald-950/30 rounded-lg p-4 flex items-center justify-between gap-3 flex-wrap">
+          <p className="text-sm text-emerald-300">
+            Pull Request created successfully.
+          </p>
+          <a
+            href={resolvedPrUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-sm font-semibold text-emerald-200 underline hover:text-emerald-100 whitespace-nowrap"
+          >
+            View Pull Request ↗
+          </a>
+        </div>
+      )}
 
       {isLoadingTask && (
         <p className="text-xs text-slate-500 animate-pulse">

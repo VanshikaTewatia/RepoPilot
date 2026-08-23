@@ -194,3 +194,94 @@ def test_stage_all_changes_preserves_legitimate_source_changes():
         assert "src/coverage_tool.py" in changed
         assert "src/app.py" in changed
         assert ".coverage" not in changed
+
+
+# -------------------------------------------------------------------------
+# Branch / commit helpers (used by the GitHub approval flow)
+# -------------------------------------------------------------------------
+def test_create_branch_forks_from_base_and_checks_it_out():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_dir = _make_committed_repo(Path(tmpdir))
+        with git.Repo(repo_dir) as gr:
+            base = gr.active_branch.name
+
+        GitService.create_branch(repo_dir, "repopilot/task-1", base)
+
+        with git.Repo(repo_dir) as gr:
+            assert gr.active_branch.name == "repopilot/task-1"
+            assert base in [h.name for h in gr.heads]
+
+
+def test_create_branch_recreates_existing_branch_from_latest_base():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_dir = _make_committed_repo(Path(tmpdir))
+        with git.Repo(repo_dir) as gr:
+            base = gr.active_branch.name
+
+        GitService.create_branch(repo_dir, "repopilot/task-1", base)
+        # Simulate a leftover branch from a previous failed/retried approval
+        # by advancing it, then re-running create_branch for the same task.
+        (repo_dir / "src" / "leftover.py").write_text("X = 1\n", encoding="utf-8")
+        with git.Repo(repo_dir) as gr:
+            gr.git.add(A=True)
+            gr.index.commit("stale attempt")
+
+        GitService.create_branch(repo_dir, "repopilot/task-1", base)
+
+        with git.Repo(repo_dir) as gr:
+            assert gr.active_branch.name == "repopilot/task-1"
+            # The stale commit is gone -- branch was rebuilt fresh from base.
+            assert not (repo_dir / "src" / "leftover.py").exists()
+
+
+def test_checkout_force_discards_uncommitted_changes():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_dir = _make_committed_repo(Path(tmpdir))
+        with git.Repo(repo_dir) as gr:
+            base = gr.active_branch.name
+
+        GitService.create_branch(repo_dir, "repopilot/task-1", base)
+        (repo_dir / "src" / "app.py").write_text("VALUE = 999\n", encoding="utf-8")
+
+        GitService.checkout(repo_dir, base, force=True)
+
+        with git.Repo(repo_dir) as gr:
+            assert gr.active_branch.name == base
+        assert (repo_dir / "src" / "app.py").read_text(encoding="utf-8") == "VALUE = 1\n"
+
+
+def test_delete_branch_removes_local_ref_and_is_a_noop_if_missing():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_dir = _make_committed_repo(Path(tmpdir))
+        with git.Repo(repo_dir) as gr:
+            base = gr.active_branch.name
+
+        GitService.create_branch(repo_dir, "repopilot/task-1", base)
+        GitService.checkout(repo_dir, base)
+        GitService.delete_branch(repo_dir, "repopilot/task-1")
+
+        with git.Repo(repo_dir) as gr:
+            assert "repopilot/task-1" not in [h.name for h in gr.heads]
+
+        # Deleting again (already gone) must not raise.
+        GitService.delete_branch(repo_dir, "repopilot/task-1")
+
+
+def test_commit_all_stages_and_commits_pending_changes():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_dir = _make_committed_repo(Path(tmpdir))
+        (repo_dir / "src" / "app.py").write_text("VALUE = 2\n", encoding="utf-8")
+        (repo_dir / "src" / "new_file.py").write_text("NEW = True\n", encoding="utf-8")
+
+        committed = GitService.commit_all(repo_dir, "apply fix")
+        assert committed is True
+
+        with git.Repo(repo_dir) as gr:
+            assert not gr.is_dirty(untracked_files=True)
+            assert gr.head.commit.message == "apply fix"
+
+
+def test_commit_all_returns_false_when_nothing_to_commit():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo_dir = _make_committed_repo(Path(tmpdir))
+        assert GitService.commit_all(repo_dir, "no-op") is False

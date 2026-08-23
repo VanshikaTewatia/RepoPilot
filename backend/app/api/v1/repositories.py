@@ -1,5 +1,7 @@
 """Repository management and indexing API routes."""
 
+import asyncio
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
@@ -8,7 +10,9 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from app.api.deps import SessionDep
+from app.core.config import settings
 from app.db.models.repository import Repository
+from app.services.github_service import GitHubError, GitHubService, parse_github_url
 from app.services.indexing.indexer import RepositoryIndexer
 
 router = APIRouter(prefix="/repositories", tags=["Repositories"])
@@ -19,6 +23,21 @@ class RepositoryCreate(BaseModel):
     local_path: str = Field(..., example="C:/Users/Lakshay/RepoPilot")
     remote_url: str | None = None
     default_branch: str = "main"
+
+
+class RepositoryCreateFromGitHub(BaseModel):
+    """Register a repository by cloning it from GitHub.
+
+    No token field here by design: GITHUB_TOKEN is read only from server-side
+    settings (see app.core.config) and is never accepted from a request body.
+    """
+
+    url: str = Field(..., example="https://github.com/octocat/Hello-World")
+    name: str | None = Field(default=None, example="Hello-World")
+    default_branch: str | None = Field(
+        default=None,
+        description="Overrides the repository's actual default branch if provided.",
+    )
 
 
 class RepositoryResponse(BaseModel):
@@ -49,6 +68,57 @@ async def create_repository(
         local_path=str(repo_path),
         remote_url=payload.remote_url,
         default_branch=payload.default_branch,
+        status="pending",
+    )
+    db.add(repo)
+    await db.commit()
+    await db.refresh(repo)
+    return repo
+
+
+@router.post("/github", response_model=RepositoryResponse, status_code=status.HTTP_201_CREATED)
+async def create_repository_from_github(
+    payload: RepositoryCreateFromGitHub,
+    db: SessionDep,
+) -> Repository:
+    """Register a repository by cloning it from a validated GitHub HTTPS URL.
+
+    Public repositories work with no server configuration. Private repositories
+    require GITHUB_TOKEN to be set in the backend environment; the token is never
+    read from this request, stored in the database, or echoed back in the response.
+    """
+    try:
+        owner, repo_name = parse_github_url(payload.url)
+    except GitHubError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    github = GitHubService(api_base_url=settings.github_api_base_url)
+    token = settings.github_token or None
+
+    try:
+        meta = await asyncio.to_thread(github.validate_repository, owner, repo_name, token)
+    except GitHubError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    workspace_root = Path(settings.workspace_dir).resolve()
+    dest_dir = workspace_root / "repos" / f"{owner}_{repo_name}_{uuid.uuid4().hex[:8]}"
+
+    try:
+        cloned_path = await asyncio.to_thread(
+            github.clone_repository,
+            meta["clone_url"],
+            dest_dir,
+            workspace_root,
+            token,
+        )
+    except GitHubError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    repo = Repository(
+        name=payload.name or repo_name,
+        local_path=str(cloned_path),
+        remote_url=f"https://github.com/{owner}/{repo_name}",
+        default_branch=payload.default_branch or meta["default_branch"],
         status="pending",
     )
     db.add(repo)

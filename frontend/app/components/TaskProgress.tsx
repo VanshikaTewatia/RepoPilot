@@ -10,6 +10,7 @@ import StatusBadge from "./StatusBadge";
  */
 const TERMINAL_STATUSES = new Set([
   "human_approval_required",
+  "approval_failed",
   "approved",
   "rejected",
   "failed",
@@ -44,6 +45,7 @@ const STATUS_TO_STEP: Record<string, number> = {
   verifying: 4,
   verified: 5,
   human_approval_required: 5,
+  approval_failed: 5,
 };
 
 const TERMINAL_STEP_LABELS: Record<string, string> = {
@@ -192,7 +194,9 @@ export default function TaskProgress({
             <StatusBadge status={task.status} size="lg" />
             <span className="text-sm text-slate-300">
               {task.status === "approved" &&
-                "Patch applied to the original repository."}
+                (task.pr_url
+                  ? "Patch pushed to a new branch and a Pull Request was opened."
+                  : "Patch applied to the original repository.")}
               {task.status === "rejected" &&
                 "Fix rejected — workspace discarded, repository untouched."}
               {task.status === "failed" &&

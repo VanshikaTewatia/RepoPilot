@@ -205,6 +205,81 @@ class GitService:
             GitService._close_repo(repo)
 
     @staticmethod
+    def create_branch(repo_path: Path | str, branch_name: str, base_branch: str) -> None:
+        """Create (or reset) a local branch off base_branch and check it out.
+
+        If a branch with this name already exists (e.g. a retried approval),
+        it is deleted and recreated from the current tip of base_branch so
+        the branch always reflects the latest approved patch.
+        """
+        repo = None
+        try:
+            repo = git.Repo(Path(repo_path).resolve())
+            repo.git.checkout(base_branch, force=True)
+            repo.git.clean("-fd")
+            if branch_name in [h.name for h in repo.heads]:
+                repo.git.branch("-D", branch_name)
+            repo.git.checkout("-b", branch_name)
+        finally:
+            GitService._close_repo(repo)
+
+    @staticmethod
+    def checkout(repo_path: Path | str, branch_name: str, force: bool = False) -> None:
+        """Check out an existing local branch.
+
+        force=True discards any uncommitted working-tree changes so the
+        repository lands in a clean, deterministic state -- used when
+        rolling back a task branch after a failed approval step.
+        """
+        repo = None
+        try:
+            repo = git.Repo(Path(repo_path).resolve())
+            if force:
+                repo.git.checkout(branch_name, force=True)
+                repo.git.clean("-fd")
+            else:
+                repo.git.checkout(branch_name)
+        finally:
+            GitService._close_repo(repo)
+
+    @staticmethod
+    def delete_branch(repo_path: Path | str, branch_name: str) -> None:
+        """Force-delete a local branch if it exists. Never raises."""
+        repo = None
+        try:
+            repo = git.Repo(Path(repo_path).resolve())
+            if branch_name in [h.name for h in repo.heads]:
+                repo.git.branch("-D", branch_name)
+        except Exception as e:
+            logger.warning(f"Could not delete branch '{branch_name}' in '{repo_path}': {e}")
+        finally:
+            GitService._close_repo(repo)
+
+    @staticmethod
+    def commit_all(repo_path: Path | str, message: str) -> bool:
+        """Stage and commit all changes (including new files) in the working tree.
+
+        Prunes runtime test artifacts first, same as stage_all_changes.
+        Returns False if there was nothing to commit.
+        """
+        workspace = Path(repo_path).resolve()
+        GitService._prune_runtime_artifacts(workspace)
+
+        repo = None
+        try:
+            repo = git.Repo(workspace)
+            repo.git.add(A=True)
+            if not repo.is_dirty(untracked_files=True) and not repo.index.diff("HEAD"):
+                return False
+            with repo.config_writer() as writer:
+                writer.set_value("user", "name", "RepoPilot")
+                writer.set_value("user", "email", "repopilot@localhost")
+            repo.index.commit(message)
+            return True
+        finally:
+            GitService._close_repo(repo)
+
+    @staticmethod
     def apply_diff(target_dir: Path | str, diff_text: str) -> Tuple[bool, str]:
         """Safely apply a unified diff to a git repository working tree.
 
