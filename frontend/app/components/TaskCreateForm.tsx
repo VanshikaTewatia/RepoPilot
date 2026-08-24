@@ -20,9 +20,7 @@ export default function TaskCreateForm({
   repo,
   onSubmit,
 }: TaskCreateFormProps) {
-  const [description, setDescription] = useState(
-    "Fix VIP discount to apply to order subtotal in OrderService"
-  );
+  const [description, setDescription] = useState("");
   const [title, setTitle] = useState("");
   const [testTarget, setTestTarget] = useState("");
   const [maxAttempts, setMaxAttempts] = useState(3);
@@ -59,7 +57,7 @@ export default function TaskCreateForm({
           className="w-full bg-slate-950 border border-slate-700 rounded-lg px-4 py-3 text-slate-200 text-sm focus:outline-none focus:border-emerald-500 resize-y min-h-[80px]"
           value={description}
           onChange={(e) => setDescription(e.target.value)}
-          placeholder="Describe the bug or the change the agent should make..."
+          placeholder="Describe the bug or the change the agent should make, e.g. 'Fix the off-by-one error in the pagination helper' or 'Add input validation to the signup form'..."
           rows={3}
         />
       </label>
@@ -107,7 +105,7 @@ export default function TaskCreateForm({
               className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-emerald-500"
               value={testTarget}
               onChange={(e) => setTestTarget(e.target.value)}
-              placeholder="tests/test_order_service.py::test_vip_discount"
+              placeholder="tests/test_module.py::test_case"
             />
           </label>
           <label className="block space-y-1">

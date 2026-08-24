@@ -2,11 +2,13 @@
 
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from app.core.config import settings
 from app.core.logging import logger
@@ -20,6 +22,26 @@ except ImportError:
 
 # Global cache to prevent repeated failed Docker socket attempts
 _GLOBAL_DOCKER_DISABLED = False
+
+# Dependency installation is best-effort and non-fatal: if it fails (or the
+# target repo has no network access, e.g. inside a network_mode="none"
+# sandbox container) the install log is still surfaced in the test output,
+# and pytest is attempted anyway.
+_DEPENDENCY_INSTALL_TIMEOUT_SECONDS = 120
+
+
+def _detect_dependency_install_args(workspace: Path) -> Optional[List[str]]:
+    """Return pip install arguments for the repo's dependency manifest, if any.
+
+    Covers the two common cases (a plain requirements.txt, or an installable
+    package via pyproject.toml/setup.py). Repos using other package managers
+    (poetry.lock-only, Pipenv, etc.) are not covered by this best-effort step.
+    """
+    if (workspace / "requirements.txt").is_file():
+        return ["-r", "requirements.txt"]
+    if (workspace / "pyproject.toml").is_file() or (workspace / "setup.py").is_file():
+        return ["."]
+    return None
 
 
 class DockerTestRunner:
@@ -92,13 +114,31 @@ class DockerTestRunner:
         test_path: Optional[str],
         start_time: float,
     ) -> Dict[str, Any]:
-        """Run test command inside ephemeral Docker container."""
+        """Run test command inside ephemeral Docker container.
+
+        If the repo has a recognized dependency manifest, it is installed
+        inside the (ephemeral, single-use) container immediately before
+        pytest runs. This only succeeds when the sandbox's network mode
+        permits outbound access -- under the default network_mode="none" the
+        install has no network and will fail, but pytest still runs
+        afterwards so a real bug fix isn't masked by an unrelated install
+        failure.
+        """
         global _GLOBAL_DOCKER_DISABLED
-        cmd = ["pytest", "-v", "-o", "testpaths=."]
-        if test_path:
-            cmd.append(test_path)
+        test_target = test_path if test_path else "."
+        install_args = _detect_dependency_install_args(workspace)
+
+        if install_args:
+            install_cmd = (
+                "pip install --quiet --disable-pip-version-check --no-input "
+                + " ".join(install_args)
+            )
+            # ';' (not '&&'): a failed/network-less install must not prevent
+            # pytest from running -- its output stays visible either way.
+            script = f'{install_cmd}; pytest -v -o testpaths=. "$@"'
+            cmd = ["sh", "-c", script, "sh", test_target]
         else:
-            cmd.append(".")
+            cmd = ["pytest", "-v", "-o", "testpaths=.", test_target]
 
         try:
             volumes = {
@@ -140,18 +180,66 @@ class DockerTestRunner:
             self._docker_available = False
             return self._run_in_subprocess(workspace, test_path, start_time)
 
+    def _install_dependencies(self, workspace: Path) -> tuple[str, Optional[str]]:
+        """Best-effort install of the repo's dependency manifest for the subprocess fallback.
+
+        Installs into an ephemeral, isolated `--target` directory -- never
+        into the backend's own environment -- so a target repo's
+        dependencies can never mutate or break RepoPilot's own packages.
+        Returns (log_text, pythonpath_dir). pythonpath_dir is None if there
+        was nothing to install or the target directory could not be created.
+        """
+        install_args = _detect_dependency_install_args(workspace)
+        if not install_args:
+            return "", None
+
+        target_dir = tempfile.mkdtemp(prefix="repopilot_deps_")
+        cmd = [
+            sys.executable, "-m", "pip", "install",
+            "--quiet", "--disable-pip-version-check", "--no-input",
+            "--target", target_dir,
+        ] + install_args
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                timeout=_DEPENDENCY_INSTALL_TIMEOUT_SECONDS,
+            )
+            log = f"$ pip install {' '.join(install_args)}\n{result.stdout}\n{result.stderr}".strip()
+            return log, target_dir
+        except subprocess.TimeoutExpired:
+            return f"Dependency installation timed out after {_DEPENDENCY_INSTALL_TIMEOUT_SECONDS}s.", target_dir
+        except Exception as e:
+            return f"Dependency installation error: {e}", target_dir
+
     def _run_in_subprocess(
         self,
         workspace: Path,
         test_path: Optional[str],
         start_time: float,
     ) -> Dict[str, Any]:
-        """Local subprocess test execution fallback using current python environment."""
+        """Local subprocess test execution fallback using the current python interpreter.
+
+        If the repo has a recognized dependency manifest, it is installed
+        first into an isolated, ephemeral directory (see _install_dependencies)
+        so pytest can import the repo's real dependencies without RepoPilot's
+        own environment ever being modified. A failed install does not block
+        the test run -- its log is prepended to the output either way.
+        """
+        install_log, pythonpath_dir = self._install_dependencies(workspace)
+
         cmd = [sys.executable, "-m", "pytest", "-v", "-o", "testpaths=."]
         if test_path:
             cmd.append(test_path)
         else:
             cmd.append(".")
+
+        env = os.environ.copy()
+        if pythonpath_dir:
+            existing = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = f"{pythonpath_dir}{os.pathsep}{existing}" if existing else pythonpath_dir
 
         try:
             result = subprocess.run(
@@ -160,9 +248,10 @@ class DockerTestRunner:
                 capture_output=True,
                 text=True,
                 timeout=self.timeout,
+                env=env,
             )
             duration = time.time() - start_time
-            combined_output = f"{result.stdout}\n{result.stderr}".strip()
+            combined_output = f"{install_log}\n\n{result.stdout}\n{result.stderr}".strip()
             parsed = self._parse_pytest_output(combined_output)
 
             success = (result.returncode == 0 and parsed["failed"] == 0 and parsed["passed"] > 0)
@@ -179,7 +268,7 @@ class DockerTestRunner:
             return {
                 "success": False,
                 "exit_code": 124,
-                "output": f"Execution timed out after {self.timeout} seconds.",
+                "output": f"{install_log}\n\nExecution timed out after {self.timeout} seconds.".strip(),
                 "passed": 0,
                 "failed": 1,
                 "duration": round(duration, 2),
@@ -189,11 +278,14 @@ class DockerTestRunner:
             return {
                 "success": False,
                 "exit_code": 1,
-                "output": f"Execution error: {e}",
+                "output": f"{install_log}\n\nExecution error: {e}".strip(),
                 "passed": 0,
                 "failed": 1,
                 "duration": round(duration, 2),
             }
+        finally:
+            if pythonpath_dir:
+                shutil.rmtree(pythonpath_dir, ignore_errors=True)
 
     def _parse_pytest_output(self, output: str) -> Dict[str, int]:
         """Extract passed and failed count from pytest summary."""

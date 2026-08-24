@@ -158,6 +158,18 @@ def test_clone_repository_uses_authenticated_url_when_token_present():
         assert called_url.startswith("https://x-access-token:")
 
 
+def test_clone_repository_uses_shallow_depth_one():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "workspaces"
+        root.mkdir()
+        dest = root / "repos" / "a_b_shallow"
+
+        with patch("app.services.github_service.git.Repo.clone_from") as mock_clone:
+            GitHubService().clone_repository("https://github.com/a/b.git", dest, root, token=None)
+
+        assert mock_clone.call_args.kwargs.get("depth") == 1
+
+
 def test_clone_repository_public_repo_without_token_uses_plain_url():
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp) / "workspaces"

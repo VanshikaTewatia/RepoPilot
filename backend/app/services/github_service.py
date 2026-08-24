@@ -169,7 +169,11 @@ class GitHubService:
         dest.parent.mkdir(parents=True, exist_ok=True)
         authed_url = self._authenticated_url(clone_url, token)
         try:
-            git.Repo.clone_from(authed_url, dest)
+            # Shallow clone: RepoPilot only ever branches off the current tip
+            # of the repository's default branch, so full history is never
+            # needed -- this cuts connect latency and disk use significantly
+            # on larger repositories.
+            git.Repo.clone_from(authed_url, dest, depth=1)
         except git.GitCommandError as e:
             raise GitHubError(f"Failed to clone repository: {_scrub(str(e), token)}") from None
         return dest
