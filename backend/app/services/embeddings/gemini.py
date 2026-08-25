@@ -1,20 +1,43 @@
 """Gemini embedding provider implementation using official google-genai SDK."""
 
 import asyncio
-from typing import List, Optional
+import time
+from typing import Callable, List, Optional
 
 from google import genai
 from google.genai import types
-from tenacity import (
-    retry,
-    retry_if_not_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
 
 from app.core.config import settings
 from app.core.logging import logger
-from app.services.embeddings.base import EmbeddingProvider, EmbeddingValidationError
+from app.services.embeddings.base import (
+    EmbeddingProvider,
+    EmbeddingRateLimitError,
+    EmbeddingValidationError,
+)
+from app.services.embeddings.rate_limiter import TokenPerMinuteRateLimiter, estimate_tokens
+
+
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    """True for Gemini 429 / RESOURCE_EXHAUSTED errors (the SDK's ClientError)."""
+    return getattr(exc, "code", None) == 429 or getattr(exc, "status", None) == "RESOURCE_EXHAUSTED"
+
+
+def _extract_retry_after_seconds(exc: BaseException) -> Optional[float]:
+    """Read a Retry-After hint off the SDK error's underlying HTTP response, if any."""
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return None
+    value = getter("Retry-After", None) or getter("retry-after", None)
+    if value is None:
+        return None
+    try:
+        return max(float(value), 0.0)
+    except (TypeError, ValueError):
+        return None
 
 
 class GeminiEmbeddingProvider(EmbeddingProvider):
@@ -25,11 +48,20 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
         api_key: Optional[str] = None,
         model_name: Optional[str] = None,
         dimension: Optional[int] = None,
+        rate_limiter: Optional[TokenPerMinuteRateLimiter] = None,
+        sleep_fn: Optional[Callable[[float], None]] = None,
     ):
         self._api_key = api_key if api_key is not None else settings.gemini_api_key
         self._model_name = model_name or settings.gemini_embedding_model
         self._dimension = dimension if dimension is not None else settings.gemini_embedding_dimension
         self._client: Optional[genai.Client] = None
+        self._rate_limiter = rate_limiter or TokenPerMinuteRateLimiter(
+            tpm_limit=settings.gemini_embedding_tpm_limit,
+            window_seconds=settings.gemini_embedding_rate_limit_window_seconds,
+        )
+        # Injectable for tests: the retry loop runs inside a worker thread
+        # (via asyncio.to_thread), so it uses a blocking sleep, not asyncio.sleep.
+        self._sleep_fn = sleep_fn or time.sleep
 
     @property
     def dimension(self) -> int:
@@ -65,13 +97,50 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
                 f"expected {self._dimension}."
             )
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        reraise=True,
-        retry=retry_if_not_exception_type(EmbeddingValidationError),
-    )
-    def _call_embed_single_sync(self, text: str) -> List[float]:
+    def _run_with_bounded_retry(self, fn: Callable[[], List], attempt_label: str) -> List:
+        """Run ``fn`` with bounded exponential backoff, honoring Retry-After on 429s.
+
+        Never retries ``EmbeddingValidationError`` (a malformed response, not a
+        transient failure). After exhausting the configured max attempts on a
+        rate-limit error, raises ``EmbeddingRateLimitError`` with a clear message
+        instead of hanging or surfacing an opaque SDK exception.
+        """
+        max_attempts = max(1, settings.gemini_embedding_max_retries)
+        base_delay = settings.gemini_embedding_retry_base_seconds
+        max_delay = settings.gemini_embedding_retry_max_seconds
+        last_exc: Optional[BaseException] = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return fn()
+            except EmbeddingValidationError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - re-classified below
+                last_exc = exc
+                if attempt >= max_attempts:
+                    break
+                retry_after = _extract_retry_after_seconds(exc)
+                if retry_after is not None:
+                    delay = min(retry_after, max_delay)
+                else:
+                    delay = min(base_delay * (2 ** (attempt - 1)), max_delay)
+                logger.warning(
+                    f"Gemini {attempt_label} embedding call failed "
+                    f"(attempt {attempt}/{max_attempts}): {exc}. Retrying in {delay:.1f}s."
+                )
+                self._sleep_fn(delay)
+
+        assert last_exc is not None
+        if _is_rate_limit_error(last_exc):
+            raise EmbeddingRateLimitError(
+                f"Gemini embedding quota exceeded for model {self._model_name!r} after "
+                f"{max_attempts} attempt(s); the tokens-per-minute limit could not be "
+                f"satisfied within the bounded retry budget. Last error: {last_exc}",
+                retry_after=_extract_retry_after_seconds(last_exc),
+            ) from last_exc
+        raise last_exc
+
+    def _call_embed_single_once(self, text: str) -> List[float]:
         """Synchronous single text embedding call.
 
         The google-genai SDK normalizes every ``embed_content`` response into an
@@ -101,13 +170,13 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
             )
         return list(values)
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        reraise=True,
-        retry=retry_if_not_exception_type(EmbeddingValidationError),
-    )
-    def _call_embed_batch_sync(self, texts: List[str]) -> List[List[float]]:
+    def _call_embed_single_sync(self, text: str) -> List[float]:
+        """Bounded-retry wrapper around a single-text embedding call."""
+        return self._run_with_bounded_retry(
+            lambda: self._call_embed_single_once(text), attempt_label="single"
+        )
+
+    def _call_embed_batch_once(self, texts: List[str]) -> List[List[float]]:
         """Synchronous batch embedding call.
 
         The google-genai SDK returns all embeddings (single or batch) under
@@ -137,6 +206,12 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
             vectors.append(list(e.values))
         return vectors
 
+    def _call_embed_batch_sync(self, texts: List[str]) -> List[List[float]]:
+        """Bounded-retry wrapper around a batch embedding call."""
+        return self._run_with_bounded_retry(
+            lambda: self._call_embed_batch_once(texts), attempt_label="batch"
+        )
+
     async def embed_text(self, text: str) -> List[float]:
         """Generate embedding vector for a single string asynchronously."""
         if not text.strip():
@@ -146,6 +221,7 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
         if self._is_mock_or_test_key():
             return [0.01] * self._dimension
 
+        await self._rate_limiter.acquire(estimate_tokens(text))
         vector = await asyncio.to_thread(self._call_embed_single_sync, text)
         self._validate_vector(vector)
         return vector
@@ -153,14 +229,19 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
     async def embed_batch(
         self,
         texts: List[str],
-        batch_size: int = 50,
+        batch_size: Optional[int] = None,
     ) -> List[List[float]]:
         """Generate embeddings in chunked batches asynchronously.
 
-        Guarantees exactly one embedding vector per input text. Raises
-        ``EmbeddingValidationError`` if the provider returns fewer vectors than
-        requested or any vector has the wrong dimension, instead of silently
-        returning a partial result.
+        Batches are sent strictly sequentially, each paced by the configured
+        tokens-per-minute rate limiter, so this method never fires requests
+        faster than the Gemini embedding quota allows. Guarantees exactly one
+        embedding vector per input text. Raises ``EmbeddingValidationError`` if
+        the provider returns fewer vectors than requested or any vector has the
+        wrong dimension, instead of silently returning a partial result.
+
+        ``batch_size`` defaults to ``settings.gemini_embedding_batch_size`` when
+        omitted, so callers don't need to hardcode a value.
         """
         if not texts:
             return []
@@ -168,6 +249,9 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
         # Return mock vectors in test or mock environment
         if self._is_mock_or_test_key():
             return [[0.01] * self._dimension for _ in texts]
+
+        if batch_size is None:
+            batch_size = settings.gemini_embedding_batch_size
 
         all_embeddings: List[List[float]] = []
 
@@ -178,6 +262,8 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
 
             batch_vectors: List[List[float]] = []
             if non_empty_texts:
+                batch_tokens = sum(estimate_tokens(t) for t in non_empty_texts)
+                await self._rate_limiter.acquire(batch_tokens)
                 batch_vectors = await asyncio.to_thread(
                     self._call_embed_batch_sync, non_empty_texts
                 )

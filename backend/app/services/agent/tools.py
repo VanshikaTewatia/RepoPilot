@@ -7,7 +7,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from app.core.logging import logger
-from app.services.sandbox.docker_runner import DockerTestRunner
+from app.services.verification.engine import VerificationEngine
 
 
 def _resolve_safe_path(base_dir: Path | str, target_rel_path: str) -> Path:
@@ -163,6 +163,9 @@ def apply_patch(
 
 
 def run_tests(workspace_dir: str, test_path: Optional[str] = None) -> Dict[str, Any]:
-    """Execute pytest suite in Docker sandbox or secure local runner."""
-    runner = DockerTestRunner()
-    return runner.run_tests(workspace_path=workspace_dir, test_path=test_path)
+    """Detect the repository's project ecosystem and run its verification command
+    in Docker sandbox or secure local runner. Never assumes pytest for a
+    non-Python project -- see app.services.verification for the detection and
+    per-ecosystem adapter logic."""
+    engine = VerificationEngine()
+    return engine.verify(workspace_path=workspace_dir, test_path=test_path)

@@ -12,6 +12,7 @@ from sqlalchemy import select
 from app.api.deps import SessionDep
 from app.core.config import settings
 from app.db.models.repository import Repository
+from app.services.embeddings.base import EmbeddingRateLimitError
 from app.services.github_service import GitHubError, GitHubService, parse_github_url
 from app.services.indexing.indexer import RepositoryIndexer
 
@@ -146,7 +147,19 @@ async def index_repository_endpoint(
         raise HTTPException(status_code=404, detail="Repository not found")
 
     indexer = RepositoryIndexer(repo_path=repo.local_path, repo_id=repo.id)
-    total_chunks, reused_chunks = await indexer.index_repository(db)
+    try:
+        total_chunks, reused_chunks = await indexer.index_repository(db)
+    except EmbeddingRateLimitError as e:
+        headers = {"Retry-After": str(int(e.retry_after))} if e.retry_after else None
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=(
+                "Indexing was paused because the Gemini embedding API's rate/quota "
+                "limit was exceeded and retries were exhausted. Wait a bit and re-run "
+                f"indexing — chunks already embedded will be reused, not re-embedded. ({e})"
+            ),
+            headers=headers,
+        ) from e
 
     repo.status = "indexed"
     repo.indexed_at = datetime.now(timezone.utc)

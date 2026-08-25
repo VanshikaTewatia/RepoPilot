@@ -231,3 +231,51 @@ async def test_index_repository_reuses_existing_embeddings(monkeypatch):
         assert len(session.added) == total
         assert all(c.embedding is not None for c in session.added)
         assert all(len(c.embedding) == 3072 for c in session.added)
+        # The reused chunk kept its previously stored vector rather than a freshly
+        # generated one (the fake provider always returns [0.01]*3072).
+        reused_chunk = next(c for c in session.added if c.content_hash == first.content_hash)
+        assert reused_chunk.embedding == [0.5] * 3072
+
+
+@pytest.mark.asyncio
+async def test_index_repository_does_not_re_embed_unchanged_chunks(monkeypatch):
+    """Rerunning indexing must not send already-indexed chunks back to the embedding
+    provider at all -- only new/modified chunks should ever reach embed_batch."""
+    captured_texts: list = []
+
+    class RecordingProvider:
+        dimension = 3072
+
+        async def embed_batch(self, texts, batch_size=50):
+            captured_texts.extend(texts)
+            return [[0.01] * 3072 for _ in texts]
+
+    monkeypatch.setattr(
+        "app.services.indexing.indexer.GeminiEmbeddingProvider",
+        lambda *a, **k: RecordingProvider(),
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        indexer = _make_repo(
+            tmpdir,
+            {"module_a.py": "def a(): pass\n", "module_b.py": "def b(): pass\n"},
+            repo_id=7,
+        )
+        chunks = indexer.scan_all_chunks()
+        unchanged, changed = chunks[0], chunks[1]
+        session = FakeSession(
+            existing_rows=[
+                SimpleNamespace(
+                    file_path=unchanged.file_path,
+                    content_hash=unchanged.content_hash,
+                    embedding=[0.9] * 3072,
+                )
+            ]
+        )
+
+        total, reused = await indexer.index_repository(session)
+
+        assert reused == 1
+        assert total == len(chunks)
+        # Only the changed/new chunk's source was ever sent to the provider.
+        assert captured_texts == [changed.source_code]

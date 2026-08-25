@@ -78,6 +78,30 @@ class Settings(BaseSettings):
         default=3072,
         description="Dimension of Gemini embedding vectors",
     )
+    gemini_embedding_batch_size: int = Field(
+        default=20,
+        description="Number of text chunks sent per embedding API request",
+    )
+    gemini_embedding_tpm_limit: int = Field(
+        default=30000,
+        description="Gemini embedding tokens-per-minute quota to stay under when pacing requests",
+    )
+    gemini_embedding_rate_limit_window_seconds: float = Field(
+        default=60.0,
+        description="Sliding window size in seconds used to enforce the TPM budget",
+    )
+    gemini_embedding_max_retries: int = Field(
+        default=5,
+        description="Maximum attempts for a single embedding API call before giving up",
+    )
+    gemini_embedding_retry_base_seconds: float = Field(
+        default=2.0,
+        description="Base delay for exponential backoff between embedding retry attempts",
+    )
+    gemini_embedding_retry_max_seconds: float = Field(
+        default=60.0,
+        description="Upper bound on any single retry delay (including Retry-After) in seconds",
+    )
 
     # -------------------------------------------------------------------------
     # Database (PostgreSQL 16 + pgvector)

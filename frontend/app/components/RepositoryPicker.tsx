@@ -161,8 +161,10 @@ export default function RepositoryPicker({
       );
       onSelect({ ...selectedRepo, status: "indexed" });
     } catch (err) {
-      const detail =
-        err instanceof ApiError ? err.detail : "Indexing failed.";
+      let detail = err instanceof ApiError ? err.detail : "Indexing failed.";
+      if (err instanceof ApiError && err.status === 429) {
+        detail = `Gemini embedding rate limit reached: ${detail}`;
+      }
       setIndexMessage(detail);
       setIndexIsError(true);
     } finally {
