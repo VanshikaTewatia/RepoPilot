@@ -2,19 +2,8 @@
 
 import React, { useEffect, useRef, useState } from "react";
 import { Task, getTask } from "@/lib/api";
+import { isFinalTaskStatus, isTerminalTaskStatus } from "@/lib/taskStatus";
 import StatusBadge from "./StatusBadge";
-
-/**
- * Statuses at which the agent loop has stopped and human interaction (or
- * nothing further) is required. Polling stops on these.
- */
-const TERMINAL_STATUSES = new Set([
-  "human_approval_required",
-  "approval_failed",
-  "approved",
-  "rejected",
-  "failed",
-]);
 
 /** Ordered workflow steps shown in the stepper. */
 const STEPS = [
@@ -48,10 +37,24 @@ const STATUS_TO_STEP: Record<string, number> = {
   approval_failed: 5,
 };
 
-const TERMINAL_STEP_LABELS: Record<string, string> = {
-  approved: "Approved",
-  rejected: "Rejected",
-  failed: "Failed",
+/** Final-outcome display copy. Every status in `taskStatus.ts`'s "final"
+ * category MUST have an entry here -- this is what renders the terminal
+ * outcome box instead of the in-progress stepper/notes. */
+const OUTCOME_STYLES: Record<string, string> = {
+  approved: "bg-emerald-950/40 border-emerald-800",
+  rejected: "bg-rose-950/40 border-rose-800",
+  failed: "bg-red-950/40 border-red-900",
+  unable_to_verify: "bg-amber-950/40 border-amber-800",
+  no_change_needed: "bg-slate-800/40 border-slate-600",
+};
+
+const OUTCOME_MESSAGES: Record<string, string> = {
+  rejected: "Fix rejected — workspace discarded, repository untouched.",
+  failed: "The agent could not produce a verified fix within the retry budget.",
+  unable_to_verify:
+    "Verification could not be run in this environment (missing tooling or an unsupported project type) — this is not evidence that the reported issue does or does not exist.",
+  no_change_needed:
+    "No code changes were needed — the reported behavior was already correct, or the claimed issue could not be substantiated against the repository.",
 };
 
 interface TaskProgressProps {
@@ -69,8 +72,7 @@ export default function TaskProgress({
   const [pollError, setPollError] = useState<string | null>(null);
   const pollingRef = useRef(false);
 
-  const isTerminal =
-    !!task && TERMINAL_STATUSES.has(task.status);
+  const isTerminal = isTerminalTaskStatus(task?.status);
 
   // Poll GET /tasks/{id} every 2s while the task is in a non-terminal state.
   useEffect(() => {
@@ -100,7 +102,7 @@ export default function TaskProgress({
   let currentStep: number;
   if (!task) {
     currentStep = -1;
-  } else if (TERMINAL_STEP_LABELS[task.status]) {
+  } else if (isFinalTaskStatus(task.status)) {
     currentStep = STEPS.length; // everything completed
   } else {
     currentStep = STATUS_TO_STEP[task.status] ?? -1;
@@ -180,27 +182,20 @@ export default function TaskProgress({
       )}
 
       {/* Terminal outcome */}
-      {task && TERMINAL_STEP_LABELS[task.status] && (
+      {task && isFinalTaskStatus(task.status) && (
         <div
           className={`flex items-center justify-between p-4 rounded-lg border ${
-            task.status === "approved"
-              ? "bg-emerald-950/40 border-emerald-800"
-              : task.status === "rejected"
-                ? "bg-rose-950/40 border-rose-800"
-                : "bg-red-950/40 border-red-900"
+            OUTCOME_STYLES[task.status] ?? "bg-slate-800/40 border-slate-600"
           }`}
         >
           <div className="flex items-center gap-3">
             <StatusBadge status={task.status} size="lg" />
             <span className="text-sm text-slate-300">
-              {task.status === "approved" &&
-                (task.pr_url
+              {task.status === "approved"
+                ? task.pr_url
                   ? "Patch pushed to a new branch and a Pull Request was opened."
-                  : "Patch applied to the original repository.")}
-              {task.status === "rejected" &&
-                "Fix rejected — workspace discarded, repository untouched."}
-              {task.status === "failed" &&
-                "The agent could not produce a verified fix within the retry budget."}
+                  : "Patch applied to the original repository."
+                : OUTCOME_MESSAGES[task.status]}
             </span>
           </div>
         </div>

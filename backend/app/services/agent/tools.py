@@ -169,3 +169,27 @@ def run_tests(workspace_dir: str, test_path: Optional[str] = None) -> Dict[str, 
     per-ecosystem adapter logic."""
     engine = VerificationEngine()
     return engine.verify(workspace_path=workspace_dir, test_path=test_path)
+
+
+def run_tests_for_task(
+    workspace_dir: str,
+    task_description: str = "",
+    keyword_matches: Optional[List[Dict[str, Any]]] = None,
+    test_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Repository- and task-aware verification.
+
+    Detects every project actually present in the workspace and runs the
+    one(s) relevant to this task, instead of assuming the workspace root is
+    a single project -- see VerificationEngine.verify_repository and
+    app.services.verification.project_analyzer for the multi-project
+    detection and evidence-based selection logic. A workspace that resolves
+    to a single project behaves identically to run_tests().
+    """
+    engine = VerificationEngine()
+    return engine.verify_repository(
+        workspace_path=workspace_dir,
+        task_description=task_description,
+        keyword_matches=keyword_matches,
+        test_path=test_path,
+    )

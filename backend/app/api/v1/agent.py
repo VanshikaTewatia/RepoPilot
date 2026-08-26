@@ -118,14 +118,27 @@ async def create_and_run_task(
         "messages": [],
     }
 
+    # Maps the agent's real-world outcome classification (see
+    # app.services.agent.graph.finalize_node) to the task's persisted
+    # status. Only "FIXED" keeps the isolated workspace alive for human
+    # review; a claim that turned out to already be correct, or one that
+    # could not be verified at all, is never presented as a pending fix.
+    _OUTCOME_STATUS = {
+        "FIXED": "human_approval_required",
+        "NO_CHANGE_NEEDED": "no_change_needed",
+        "UNABLE_TO_VERIFY": "unable_to_verify",
+        "FAILED": "failed",
+    }
+
     try:
         final_state = await agent_app.ainvoke(initial_state)
-        verified = bool(final_state.get("is_verified"))
-        task.status = "human_approval_required" if verified else "failed"
+        outcome = final_state.get("outcome") or ("FIXED" if final_state.get("is_verified") else "FAILED")
+        task.status = _OUTCOME_STATUS.get(outcome, "failed")
         task.attempts = final_state.get("attempt_count", 0)
         test_res = final_state.get("test_results") or {}
-        task.test_output = test_res.get("output")
-        if verified:
+        outcome_detail = final_state.get("outcome_detail")
+        task.test_output = "\n\n".join(p for p in (test_res.get("output"), outcome_detail) if p) or None
+        if outcome == "FIXED":
             # Stage all workspace changes (incl. new files) so the captured
             # diff is complete and directly applicable via `git apply`.
             GitService.stage_all_changes(workspace)

@@ -291,3 +291,88 @@ def test_tools_run_tests_delegates_to_verification_engine():
 
         fake_engine.verify.assert_called_once_with(workspace_path=tmpdir, test_path="some/target")
         assert result == {"success": True, "ecosystem": "node"}
+
+
+# ---------------------------------------------------------------------------
+# verify_repository: task-aware, multi-project verification
+# ---------------------------------------------------------------------------
+def test_verify_repository_single_project_delegates_exactly_like_verify():
+    """A single-ecosystem repository must behave byte-for-byte like plain
+    verify() -- no wrapping, no behavior change for existing callers."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        _write(root, "pyproject.toml", "[project]\nname='x'\n")
+        _write(root, "test_math.py", "def test_add(): assert 1 + 1 == 2\n")
+
+        engine = VerificationEngine()
+        result = engine.verify_repository(root, task_description="fix math", keyword_matches=[])
+
+        assert result["ecosystem"] == "python"
+        assert result["success"] is True
+        assert result["project_root"] == "."
+
+
+def test_verify_repository_selects_only_the_relevant_project_in_a_monorepo():
+    """Spring backend + React frontend monorepo: a task about the React
+    product card must verify only the frontend project."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        _write(root, "backend/pom.xml", "<project></project>")
+        _write(root, "frontend/package.json", json.dumps({
+            "dependencies": {"react": "^18.0.0"},
+            "scripts": {"test": "jest"},
+        }))
+
+        def fake_run(cmd, **kwargs):
+            return _fake_completed(0, stdout="Tests: 0 failed, 2 passed, 2 total\n")
+
+        engine = VerificationEngine()
+        with patch.object(type(engine._docker_runner), "is_docker_available", False), \
+             patch("app.services.verification.engine.subprocess.run", side_effect=fake_run):
+            result = engine.verify_repository(
+                root,
+                task_description="Fix the React product card",
+                keyword_matches=[{"file": "frontend/src/ProductCard.jsx"}],
+            )
+
+        assert result["project_root"] == "frontend"
+        assert result["ecosystem"] == "node"
+        assert result["success"] is True
+        detected_roots = sorted(p["root"] for p in result["detected_projects"])
+        assert detected_roots == ["backend", "frontend"]
+
+
+def test_verify_repository_verifies_all_relevant_projects_when_ambiguous():
+    """When the task doesn't clearly point at one project, verify every
+    detected project rather than silently guessing."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        _write(root, "backend/pom.xml", "<project></project>")
+        _write(root, "frontend/package.json", json.dumps({"scripts": {"test": "jest"}}))
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:1] == ["mvn"]:
+                return _fake_completed(0, stdout="Tests run: 2, Failures: 0, Errors: 0, Skipped: 0\n")
+            return _fake_completed(0, stdout="Tests: 0 failed, 1 passed, 1 total\n")
+
+        engine = VerificationEngine()
+        with patch.object(type(engine._docker_runner), "is_docker_available", False), \
+             patch("app.services.verification.engine.subprocess.run", side_effect=fake_run):
+            result = engine.verify_repository(root, task_description="fix the login bug", keyword_matches=[])
+
+        assert result["success"] is True
+        verified_roots = sorted(r["project_root"] for r in result["project_results"])
+        assert verified_roots == ["backend", "frontend"]
+        assert result["passed"] == 3
+
+
+def test_verify_repository_unsupported_ecosystem_reports_unavailable():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        _write(root, "README.md", "no recognizable project here\n")
+
+        engine = VerificationEngine()
+        result = engine.verify_repository(root, task_description="fix the docs")
+
+        assert result["available"] is False
+        assert result["success"] is False

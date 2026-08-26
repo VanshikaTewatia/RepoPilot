@@ -3,9 +3,9 @@
 Precedence when multiple ecosystems' manifests are present in the same
 workspace (first match wins):
 
-    Go > Rust > .NET > Java(Maven) > Java(Gradle) > Node > Python
+    Go > Rust > .NET > Flutter > Dart > Java(Maven) > Java(Gradle) > Node > Python
 
-Rationale: go.mod, Cargo.toml, *.sln/*.csproj, pom.xml, and build.gradle are
+Rationale: go.mod, Cargo.toml, *.sln/*.csproj, and pubspec.yaml are
 single-purpose, unambiguous build manifests that are essentially never
 present unless that toolchain is the project's actual build system. Node's
 package.json and Python's requirements.txt/pyproject.toml, by contrast, are
@@ -17,6 +17,17 @@ putting it last ensures a more specific manifest correctly takes precedence
 when one is also present, while repos that are purely Python (like
 demo_repo, which has only pyproject.toml) are unaffected and still resolve
 to Python.
+
+Flutter/Dart is placed ahead of Java so that a Flutter project's nested
+``android/build.gradle`` scaffolding can never cause the *root* workspace
+itself to be misclassified as Java/Gradle if both happen to be visible to a
+single ``detect()`` call; the primary defense against that misclassification
+in practice is that ``JavaGradleAdapter`` only ever looks for
+``build.gradle``/``build.gradle.kts`` at the exact directory passed in, and
+multi-project repositories are analyzed per-directory by
+``app.services.verification.project_analyzer``, which also explicitly
+excludes a Flutter project's ``android``/``ios``/etc. subdirectories from
+being reported as independent projects at all.
 """
 
 from dataclasses import dataclass, field
@@ -24,7 +35,9 @@ from pathlib import Path
 from typing import List, Optional, Type
 
 from app.services.verification.adapters import (
+    DartAdapter,
     DotnetAdapter,
+    FlutterAdapter,
     GoAdapter,
     JavaGradleAdapter,
     JavaMavenAdapter,
@@ -38,6 +51,8 @@ ADAPTER_PRECEDENCE: List[Type[VerificationAdapter]] = [
     GoAdapter,
     RustAdapter,
     DotnetAdapter,
+    FlutterAdapter,
+    DartAdapter,
     JavaMavenAdapter,
     JavaGradleAdapter,
     NodeAdapter,

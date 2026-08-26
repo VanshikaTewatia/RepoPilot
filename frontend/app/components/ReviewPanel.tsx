@@ -11,6 +11,7 @@ import {
   isApiError,
   rejectTask,
 } from "@/lib/api";
+import { needsHumanReview } from "@/lib/taskStatus";
 import StatusBadge from "./StatusBadge";
 
 interface ReviewPanelProps {
@@ -164,9 +165,7 @@ export default function ReviewPanel({ task, onReviewed }: ReviewPanelProps) {
   // Server-fetched task data wins once loaded; fall back to the prop snapshot
   // while loading or if the refresh failed.
   const currentTask = refreshedTask ?? task;
-  const isPendingReview =
-    currentTask.status === "human_approval_required" ||
-    currentTask.status === "approval_failed";
+  const isPendingReview = needsHumanReview(currentTask.status);
   const resolvedPrUrl = prUrl ?? currentTask.pr_url ?? null;
 
   return (

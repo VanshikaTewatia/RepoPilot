@@ -24,3 +24,8 @@ class AgentState(TypedDict, total=False):
     error_analysis: Optional[str]
     is_verified: bool
     messages: List[Dict[str, Any]]
+    # Task-level outcome classification, distinct from is_verified/status:
+    # "FIXED" | "NO_CHANGE_NEEDED" | "UNABLE_TO_VERIFY" | "FAILED".
+    # See app.services.agent.graph.finalize_node.
+    outcome: Optional[str]
+    outcome_detail: Optional[str]

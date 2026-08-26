@@ -334,10 +334,19 @@ def edit_node(state: AgentState) -> Dict[str, Any]:
 
 
 def test_node(state: AgentState) -> Dict[str, Any]:
-    """Run pytest suite in sandbox targeting specific test or whole suite."""
+    """Run the repository's own verification command(s) targeting the
+    specific test or whole suite. Repository- and task-aware: detects every
+    real project in the workspace and runs the one(s) relevant to this task
+    rather than assuming the workspace root is a single project (see
+    tools.run_tests_for_task / VerificationEngine.verify_repository)."""
     workspace = state["workspace_dir"]
     test_target = state.get("test_target")
-    test_res = tools.run_tests(workspace, test_path=test_target)
+    test_res = tools.run_tests_for_task(
+        workspace,
+        task_description=state.get("task_description", ""),
+        keyword_matches=state.get("keyword_matches"),
+        test_path=test_target,
+    )
 
     return {
         "status": "tested",
@@ -378,6 +387,50 @@ def should_continue(state: AgentState) -> str:
     return "failed"
 
 
+def finalize_node(state: AgentState) -> Dict[str, Any]:
+    """Classify the run's real-world outcome.
+
+    This is distinct from `is_verified`/`status`, which only describe the
+    mechanical retry-loop result:
+
+    - UNABLE_TO_VERIFY: verification tooling could not actually run (e.g. an
+      unsupported ecosystem, or a required toolchain missing). Never
+      conflated with "the bug doesn't exist" -- see
+      VerificationEngine._run_adapter's tool-missing detection.
+    - NO_CHANGE_NEEDED: verification passed without any code changes, i.e.
+      the reported behavior was already correct or could not be
+      substantiated as a bug (the plan step is explicitly instructed to
+      return zero patches in that case).
+    - FIXED: one or more patches were applied and verification passed.
+    - FAILED: the reported issue could not be verified as fixed within the
+      attempt budget.
+    """
+    test_res = state.get("test_results") or {}
+    patches = state.get("proposed_patches") or []
+    is_verified = state.get("is_verified", False)
+
+    if not test_res.get("available", True):
+        outcome = "UNABLE_TO_VERIFY"
+        detail = test_res.get("detail") or "Verification tooling was unavailable for this repository."
+    elif is_verified and not patches:
+        outcome = "NO_CHANGE_NEEDED"
+        detail = (
+            "Verification passed without any code changes; the reported behavior "
+            "was already correct or the claimed issue could not be substantiated."
+        )
+    elif is_verified:
+        outcome = "FIXED"
+        detail = f"Applied {len(patches)} patch(es) and verification passed."
+    else:
+        outcome = "FAILED"
+        detail = "The reported issue could not be verified as fixed within the attempt budget."
+
+    return {
+        "outcome": outcome,
+        "outcome_detail": detail,
+    }
+
+
 def build_agent_graph():
     """Build and compile the LangGraph workflow."""
     builder = StateGraph(AgentState)
@@ -389,6 +442,7 @@ def build_agent_graph():
     builder.add_node("test", test_node)
     builder.add_node("verify", verify_node)
     builder.add_node("analyze_failure", analyze_failure_node)
+    builder.add_node("finalize", finalize_node)
 
     builder.add_edge(START, "investigate")
     builder.add_edge("investigate", "retrieve")
@@ -401,12 +455,13 @@ def build_agent_graph():
         "verify",
         should_continue,
         {
-            "human_approval": END,
+            "human_approval": "finalize",
             "analyze_failure": "analyze_failure",
-            "failed": END,
+            "failed": "finalize",
         },
     )
     builder.add_edge("analyze_failure", "retrieve")
+    builder.add_edge("finalize", END)
 
     return builder.compile()
 

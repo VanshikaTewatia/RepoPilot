@@ -1,4 +1,5 @@
 import React from "react";
+import { needsHumanReview } from "@/lib/taskStatus";
 
 const STATUS_STYLES: Record<string, string> = {
   pending: "bg-slate-800 text-slate-300 border-slate-600",
@@ -12,11 +13,15 @@ const STATUS_STYLES: Record<string, string> = {
   approved: "bg-emerald-950 text-emerald-300 border-emerald-700",
   rejected: "bg-rose-950 text-rose-300 border-rose-700",
   failed: "bg-red-950 text-red-300 border-red-700",
+  unable_to_verify: "bg-amber-950 text-amber-300 border-amber-700",
+  no_change_needed: "bg-slate-800 text-slate-300 border-slate-600",
 };
 
 const STATUS_LABELS: Record<string, string> = {
   human_approval_required: "Review Required",
   approval_failed: "Push/PR Failed",
+  unable_to_verify: "Unable To Verify",
+  no_change_needed: "No Change Needed",
 };
 
 function statusLabel(status: string): string {
@@ -51,7 +56,7 @@ export default function StatusBadge({
     <span
       className={`inline-flex items-center gap-1.5 rounded-full border font-semibold tracking-wide ${style} ${sizeClass} ${className}`}
     >
-      {(status === "human_approval_required" || status === "approval_failed") && (
+      {needsHumanReview(status) && (
         <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />
       )}
       {statusLabel(status)}

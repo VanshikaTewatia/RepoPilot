@@ -14,8 +14,7 @@ import TaskCreateForm from "./components/TaskCreateForm";
 import TaskProgress from "./components/TaskProgress";
 import ReviewPanel from "./components/ReviewPanel";
 import StatusBadge from "./components/StatusBadge";
-
-const TERMINAL_STATUSES = new Set(["approved", "rejected", "failed"]);
+import { isFinalTaskStatus, needsHumanReview } from "@/lib/taskStatus";
 
 export default function Home() {
   // Repository selection (Section 1)
@@ -211,14 +210,12 @@ export default function Home() {
         {/* Step C: human review of generated changes (also re-shown after a
             push/PR failure so the verified fix can be retried without
             re-running the agent) */}
-        {task &&
-          (task.status === "human_approval_required" ||
-            task.status === "approval_failed") && (
-            <ReviewPanel task={task} onReviewed={handleReviewed} />
-          )}
+        {task && needsHumanReview(task.status) && (
+          <ReviewPanel task={task} onReviewed={handleReviewed} />
+        )}
 
         {/* Step D: final outcome */}
-        {task && TERMINAL_STATUSES.has(task.status) && (
+        {task && isFinalTaskStatus(task.status) && (
           <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 pt-1">
             <StatusBadge status={task.status} size="lg" />
             <button
