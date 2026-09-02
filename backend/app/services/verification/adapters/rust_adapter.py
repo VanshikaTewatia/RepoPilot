@@ -9,6 +9,7 @@ from app.services.verification.base import VerificationAdapter
 
 class RustAdapter(VerificationAdapter):
     ecosystem: ClassVar[str] = "rust"
+    docker_image: ClassVar[str] = "rust:1.77-slim"
     manifest_files: ClassVar[List[str]] = ["Cargo.toml"]
 
     def install_command(self, workspace: Path) -> Optional[List[str]]:

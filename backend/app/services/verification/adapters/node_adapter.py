@@ -25,6 +25,14 @@ _LOCKFILE_PACKAGE_MANAGERS = (
 
 class NodeAdapter(VerificationAdapter):
     ecosystem: ClassVar[str] = "node"
+    # Official Node image: npm ships with it, so the common (npm) case works
+    # with zero extra provisioning. pnpm/yarn are not bundled here -- if the
+    # repository's lockfile selects one of those, verification correctly
+    # reports UNABLE_TO_VERIFY with that exact tool name unless the engine is
+    # pointed at a richer image (e.g. one that also runs
+    # `corepack enable && corepack prepare pnpm@latest --activate` at build
+    # time -- see docker/sandbox/node/Dockerfile) that bakes those in.
+    docker_image: ClassVar[str] = "node:20-slim"
     manifest_files: ClassVar[List[str]] = [
         "package.json",
         "pnpm-lock.yaml",

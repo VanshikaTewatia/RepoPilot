@@ -9,6 +9,7 @@ from app.services.verification.base import VerificationAdapter
 
 class GoAdapter(VerificationAdapter):
     ecosystem: ClassVar[str] = "go"
+    docker_image: ClassVar[str] = "golang:1.22-alpine"
     manifest_files: ClassVar[List[str]] = ["go.mod"]
 
     def install_command(self, workspace: Path) -> Optional[List[str]]:

@@ -9,6 +9,7 @@ from app.services.verification.base import VerificationAdapter
 
 class DotnetAdapter(VerificationAdapter):
     ecosystem: ClassVar[str] = "dotnet"
+    docker_image: ClassVar[str] = "mcr.microsoft.com/dotnet/sdk:8.0"
     # Documentation only -- these are extensions/globs, not literal filenames,
     # so find_manifests() is overridden below rather than relying on the
     # default literal-filename matching in VerificationAdapter.

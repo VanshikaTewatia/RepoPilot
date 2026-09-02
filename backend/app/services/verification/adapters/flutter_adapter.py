@@ -62,6 +62,10 @@ def _parse_dart_test_output(output: str, returncode: int) -> Dict[str, int]:
 
 class FlutterAdapter(VerificationAdapter):
     ecosystem: ClassVar[str] = "flutter"
+    # Official Flutter SDK images aren't published by Google to Docker Hub;
+    # this is the widely-used, actively-maintained community image that
+    # bundles the Flutter SDK (and Dart with it) ready to run.
+    docker_image: ClassVar[str] = "ghcr.io/cirruslabs/flutter:stable"
     manifest_files: ClassVar[List[str]] = ["pubspec.yaml"]
 
     @classmethod
@@ -90,6 +94,7 @@ class DartAdapter(VerificationAdapter):
     dependency (checked via FlutterAdapter first in ADAPTER_PRECEDENCE)."""
 
     ecosystem: ClassVar[str] = "dart"
+    docker_image: ClassVar[str] = "dart:stable"
     manifest_files: ClassVar[List[str]] = ["pubspec.yaml"]
 
     @classmethod

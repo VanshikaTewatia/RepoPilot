@@ -14,13 +14,17 @@ from app.services.verification.base import VerificationAdapter
 
 class JavaMavenAdapter(VerificationAdapter):
     ecosystem: ClassVar[str] = "java-maven"
+    docker_image: ClassVar[str] = "maven:3.9-eclipse-temurin-21"
     manifest_files: ClassVar[List[str]] = ["pom.xml"]
 
     def install_command(self, workspace: Path) -> Optional[List[str]]:
         return None  # `mvn test` resolves its own dependencies.
 
     def test_command(self, workspace: Path, test_path: Optional[str] = None) -> List[str]:
-        cmd = ["mvn", "-B", "test"]
+        # Prefer the repository-provided wrapper over an ambient Maven
+        # install, mirroring JavaGradleAdapter's ./gradlew preference.
+        executable = "./mvnw" if (workspace / "mvnw").is_file() else "mvn"
+        cmd = [executable, "-B", "test"]
         if test_path:
             cmd.append(f"-Dtest={test_path}")
         return cmd
@@ -41,6 +45,7 @@ class JavaMavenAdapter(VerificationAdapter):
 
 class JavaGradleAdapter(VerificationAdapter):
     ecosystem: ClassVar[str] = "java-gradle"
+    docker_image: ClassVar[str] = "gradle:8-jdk21"
     manifest_files: ClassVar[List[str]] = ["build.gradle", "build.gradle.kts"]
 
     def install_command(self, workspace: Path) -> Optional[List[str]]:
