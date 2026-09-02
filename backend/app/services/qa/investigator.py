@@ -66,6 +66,22 @@ _PROJECT_SELECTION_SCAN_MATCH_CAP = 20
 _MAX_MATCHES_PER_TERM = 5
 _MAX_TOTAL_SYMBOL_MATCHES = 25
 
+# QuestionClass wiring (Part D): the classifier's own subject_terms/kind/
+# likely_multi_file inform WHERE investigation looks, never WHAT is
+# reported as true -- project/framework facts always come from ProjectInfo
+# (RepositoryAnalyzer), completely independent of anything the classifier
+# says. Both bounds below are still small, fixed budgets, not unrestricted
+# exploration.
+#
+# existence_check questions ("is there an X") need a thorough look before
+# concluding "no evidence" is honest, so their subject_terms get a larger
+# (but still capped) search budget than the depth tier's own default.
+_EXISTENCE_CHECK_MAX_SUBJECT_TERMS = 10
+# A question the classifier expects to span multiple files gets the
+# cross-file "search for related symbols" step even at a depth tier
+# (targeted) that wouldn't otherwise run it.
+_LIKELY_MULTI_FILE_MIN_SYMBOL_TERMS = 3
+
 
 @dataclass(frozen=True)
 class _DepthConfig:
@@ -257,12 +273,24 @@ def _unique_preserve_order(items: List[str]) -> List[str]:
     return seen
 
 
-def _cheap_keyword_scan(workspace: Path, question: str) -> List[Dict[str, Any]]:
+def _cheap_keyword_scan(
+    workspace: Path, question: str, subject_terms: Optional[List[str]] = None
+) -> List[Dict[str, Any]]:
     """One bounded, whole-repository grep pass used only to help
     select_relevant_projects() pick the right project(s) in an ambiguous
-    (multi-project) repository. See _PROJECT_SELECTION_SCAN_TERMS."""
+    (multi-project) repository. See _PROJECT_SELECTION_SCAN_TERMS.
+
+    Includes the classifier's own subject_terms (also bounded) alongside
+    the naive question-word extraction -- real evidence of where those
+    terms physically live still decides project selection via
+    select_relevant_projects, this only widens which terms get looked for.
+    """
+    terms = _unique_preserve_order(
+        _question_terms(question, _PROJECT_SELECTION_SCAN_TERMS)
+        + (subject_terms or [])[:_PROJECT_SELECTION_SCAN_TERMS]
+    )
     matches: List[Dict[str, Any]] = []
-    for term in _question_terms(question, _PROJECT_SELECTION_SCAN_TERMS):
+    for term in terms:
         res = tools.search_code(str(workspace), term)
         matches.extend(res.get("matches", [])[:_PROJECT_SELECTION_SCAN_MATCH_CAP])
     return matches
@@ -276,6 +304,9 @@ async def _investigate_project(
     cfg: _DepthConfig,
     db: Optional[AsyncSession],
     retriever: CodeRetriever,
+    subject_terms: Optional[List[str]] = None,
+    kind: Optional[str] = None,
+    likely_multi_file: bool = False,
 ) -> Evidence:
     """Gather Evidence for one already-selected project, bounded by ``cfg``."""
     project_path = workspace if project.root == "." else (workspace / project.root)
@@ -313,8 +344,23 @@ async def _investigate_project(
 
     symbol_matches: List[SymbolMatch] = []
     if cfg.max_question_terms > 0 or cfg.max_symbol_terms > 0:
+        # QuestionClass wiring (Part D): the classifier's own subject_terms
+        # supplement (never replace) the naive question-word extraction --
+        # e.g. "authentication component" as a single refined phrase finds
+        # things the raw question's individual words alone would miss.
+        # existence_check gets a wider subject_terms budget since correctly
+        # answering "does X exist" requires actually having looked for X.
+        subject_term_limit = (
+            _EXISTENCE_CHECK_MAX_SUBJECT_TERMS if kind == "existence_check" else cfg.max_question_terms
+        )
+        effective_max_symbol_terms = cfg.max_symbol_terms
+        if likely_multi_file and effective_max_symbol_terms < _LIKELY_MULTI_FILE_MIN_SYMBOL_TERMS:
+            effective_max_symbol_terms = _LIKELY_MULTI_FILE_MIN_SYMBOL_TERMS
+
         terms = _unique_preserve_order(
-            _question_terms(question, cfg.max_question_terms) + _symbol_terms(chunks, cfg.max_symbol_terms)
+            _question_terms(question, cfg.max_question_terms)
+            + (subject_terms or [])[:subject_term_limit]
+            + _symbol_terms(chunks, effective_max_symbol_terms)
         )
         for term in terms:
             res = tools.search_code(str(project_path), term)
@@ -361,6 +407,9 @@ async def investigate(
     db: Optional[AsyncSession] = None,
     retriever: Optional[CodeRetriever] = None,
     max_projects: int = MAX_PROJECTS_INVESTIGATED,
+    subject_terms: Optional[List[str]] = None,
+    kind: Optional[str] = None,
+    likely_multi_file: bool = False,
 ) -> InvestigationResult:
     """Investigate a repository for a question, at the requested depth.
 
@@ -374,6 +423,14 @@ async def investigate(
     multi-project relevance selection (select_relevant_projects), and
     semantic retrieval (CodeRetriever) -- all already built and tested for
     the verification engine and the existing RAG endpoint respectively.
+
+    ``subject_terms``/``kind``/``likely_multi_file`` are the classifier's
+    own QuestionClass fields (all optional -- omitting them reproduces
+    exactly the prior behavior). They only ever influence WHERE this looks
+    (extra/wider search terms); WHAT is reported as true about the
+    repository always comes from real, deterministic evidence
+    (ProjectInfo, retrieved chunks, actual file/search matches), never from
+    the classifier's own claims -- see investigator/answerer docstrings.
     """
     if depth not in _DEPTH_CONFIGS:
         raise ValueError(f"Unknown investigation depth {depth!r}; expected one of {VALID_DEPTHS}.")
@@ -407,7 +464,7 @@ async def investigate(
     if len(projects) == 1:
         selected = list(projects)
     else:
-        keyword_matches = _cheap_keyword_scan(workspace, question)
+        keyword_matches = _cheap_keyword_scan(workspace, question, subject_terms=subject_terms)
         selected = select_relevant_projects(projects, task_description=question, keyword_matches=keyword_matches)
 
     investigated = selected[:max_projects]
@@ -423,6 +480,9 @@ async def investigate(
                 cfg=cfg,
                 db=db,
                 retriever=retriever,
+                subject_terms=subject_terms,
+                kind=kind,
+                likely_multi_file=likely_multi_file,
             )
         )
 

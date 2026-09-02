@@ -18,6 +18,8 @@ langchain-core>=0.3.0
 # Code Parsing & AST
 tree-sitter>=0.22.0
 tree-sitter-python>=0.21.0
+tree-sitter-javascript>=0.21.0
+tree-sitter-typescript>=0.21.0
 
 # Docker & Sandboxing
 docker>=7.1.0

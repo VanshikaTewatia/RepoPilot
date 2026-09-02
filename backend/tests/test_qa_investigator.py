@@ -352,3 +352,172 @@ async def test_evidence_exposes_real_framework_despite_user_terminology():
         assert ev.frameworks == ["Vue"]
         assert "React" not in ev.frameworks
         assert ev.chunks[0].file_path == "src/AuthView.vue"
+
+
+# ---------------------------------------------------------------------------
+# Part D: QuestionClass wiring (subject_terms / kind / likely_multi_file)
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_subject_terms_reach_investigation_search():
+    """A term from the classifier's subject_terms -- not derivable from the
+    raw question's own words -- must still be searched for, proving
+    QuestionClass.subject_terms actually reaches investigation rather than
+    investigate() only ever re-deriving its own naive terms."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        _write(root, "pyproject.toml", "[project]\nname='x'\n")
+        _write(root, "src/payment_processor.py", "PAYMENTGATEWAY_TOKEN = 'x'\n")
+
+        fake = _FakeRetriever(default_chunks=[_chunk("src/payment_processor.py", "process")])
+        result = await investigate(
+            str(root), repository_id=1, question="How does this work?",
+            depth="targeted", db=None, retriever=fake,
+            subject_terms=["PAYMENTGATEWAY_TOKEN"],
+        )
+
+        ev = result.evidence[0]
+        assert any("PAYMENTGATEWAY_TOKEN" in m.content for m in ev.symbol_matches)
+
+
+@pytest.mark.asyncio
+async def test_existence_check_kind_widens_subject_terms_budget():
+    """existence_check questions get a larger subject_terms search budget
+    than the depth tier's own default -- correctly answering "does X
+    exist" requires actually having looked for X."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        _write(root, "pyproject.toml", "[project]\nname='x'\n")
+        _write(root, "src/fifth_module.py", "FIFTH_UNIQUE_TOKEN = 1\n")
+
+        fake = _FakeRetriever(default_chunks=[])
+        # targeted depth's own max_question_terms is 3 -- this 5th term
+        # would never be reached without existence_check's wider budget.
+        subject_terms = ["term_one", "term_two", "term_three", "term_four", "FIFTH_UNIQUE_TOKEN"]
+        result = await investigate(
+            str(root), repository_id=1, question="Is there a fifth feature?",
+            depth="targeted", db=None, retriever=fake,
+            subject_terms=subject_terms, kind="existence_check",
+        )
+
+        ev = result.evidence[0]
+        assert any("FIFTH_UNIQUE_TOKEN" in m.content for m in ev.symbol_matches)
+
+
+@pytest.mark.asyncio
+async def test_likely_multi_file_enables_symbol_tracing_at_targeted_depth():
+    """likely_multi_file=True turns on cross-file symbol tracing even at a
+    depth tier (targeted) that wouldn't otherwise run it."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        _write(root, "pyproject.toml", "[project]\nname='x'\n")
+        _write(root, "src/payment.py", "class PaymentProcessor:\n    def charge(self):\n        pass\n")
+        _write(
+            root, "src/order_flow.py",
+            "from src.payment import PaymentProcessor\n\ndef process_order():\n    PaymentProcessor().charge()\n",
+        )
+
+        fake = _FakeRetriever(default_chunks=[_chunk("src/payment.py", "PaymentProcessor", "class")])
+        result = await investigate(
+            str(root), repository_id=1, question="How does checkout work?",
+            depth="targeted", db=None, retriever=fake,
+            likely_multi_file=True,
+        )
+
+        ev = result.evidence[0]
+        assert any(m.file == "src/order_flow.py" for m in ev.symbol_matches)
+
+
+@pytest.mark.asyncio
+async def test_investigate_defaults_unchanged_when_question_class_fields_omitted():
+    """Backward compatibility: callers that don't pass subject_terms/kind/
+    likely_multi_file (e.g. any pre-Part-D caller) get identical behavior
+    to before."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        _write(root, "pyproject.toml", "[project]\nname='x'\n")
+        _write(root, "src/cart.py", "def subtotal(items):\n    return sum(items)\n")
+
+        fake = _FakeRetriever(default_chunks=[_chunk("src/cart.py", "subtotal")])
+        result = await investigate(
+            str(root), repository_id=1, question="Where is the cart subtotal calculated?",
+            depth="shallow", db=None, retriever=fake,
+        )
+
+        ev = result.evidence[0]
+        assert ev.files_inspected == []
+        assert ev.symbol_matches == []
+
+
+# ---------------------------------------------------------------------------
+# React component / AuthContext retrieval (the Q5 fix, at the investigator
+# plumbing level -- the parser-level proof lives in test_javascript_parser.py,
+# the real end-to-end proof against Ecommerce_Frontend is a separate,
+# non-unit-test validation run)
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_react_component_and_authcontext_retrieval_via_investigator():
+    """Once RAG surfaces a real JS/JSX component chunk (as the new
+    JavaScriptParser now produces, instead of a one-line import stub), the
+    rest of the investigation pipeline treats it like any other real
+    evidence: reads the real file, and finds real cross-file references
+    via the classifier's subject_terms."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        _write(root, "package.json", json.dumps({"dependencies": {"react": "^18.0.0"}}))
+        _write(
+            root, "src/context/AuthContext.jsx",
+            "import React, { createContext, useState } from 'react';\n\n"
+            "export const AuthContext = createContext(null);\n\n"
+            "export const AuthProvider = ({ children }) => {\n"
+            "  const [user, setUser] = useState(null);\n"
+            "  const login = (u) => setUser(u);\n"
+            "  return <AuthContext.Provider value={{ user, login }}>{children}</AuthContext.Provider>;\n"
+            "};\n",
+        )
+        _write(
+            root, "src/pages/auth/LoginPage.jsx",
+            "import React, { useContext } from 'react';\n"
+            "import { AuthContext } from '../../context/AuthContext';\n\n"
+            "export default function LoginPage() {\n"
+            "  const { login } = useContext(AuthContext);\n"
+            "  return <button onClick={() => login('me')}>Login</button>;\n"
+            "}\n",
+        )
+
+        fake = _FakeRetriever(default_chunks=[
+            _chunk("src/context/AuthContext.jsx", "AuthProvider", "component"),
+        ])
+        result = await investigate(
+            str(root), repository_id=1,
+            question="Explain the React authentication component.",
+            depth="deep", db=None, retriever=fake,
+            subject_terms=["authentication component", "AuthContext"],
+            kind="existence_check",
+        )
+
+        ev = result.evidence[0]
+        assert ev.frameworks == ["React"]
+        assert any(f.file_path == "src/context/AuthContext.jsx" for f in ev.files_inspected)
+        assert any("LoginPage" in m.file for m in ev.symbol_matches)
+
+
+@pytest.mark.asyncio
+async def test_no_evidence_remains_safe_with_wider_existence_check_search():
+    """The widened existence_check search budget must not fabricate a
+    false positive when nothing genuinely relevant exists."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        _write(root, "pyproject.toml", "[project]\nname='x'\n")
+        _write(root, "src/unrelated.py", "def totally_unrelated():\n    pass\n")
+
+        fake = _FakeRetriever(default_chunks=[])
+        result = await investigate(
+            str(root), repository_id=1,
+            question="Is there a GraphQL subscription resolver?",
+            depth="deep", db=None, retriever=fake,
+            subject_terms=["GraphQLSubscriptionResolver", "graphql_subscription"],
+            kind="existence_check",
+        )
+
+        assert result.has_evidence is False
+        assert result.no_evidence_reason is not None

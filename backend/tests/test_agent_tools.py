@@ -136,3 +136,103 @@ def test_search_code_explicit_list_of_patterns():
 
         assert res["success"] is True
         assert {m["file"] for m in res["matches"]} == {"a.ts", "a.tsx"}
+
+
+# ---------------------------------------------------------------------------
+# search_code: relevance ranking (the Q5/Ecommerce_Frontend fix)
+# ---------------------------------------------------------------------------
+def test_search_code_prioritizes_filename_path_matches():
+    """A query term appearing in the file's own path must rank that file's
+    match(es) above an unrelated file that only happens to contain the
+    term deep inside noisy content -- this is what lets 'auth' reliably
+    surface AuthContext.jsx by name."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        workspace = Path(tmpdir)
+        _write(workspace, "src/context/AuthContext.jsx", "import React from 'react';\nexport const AuthProvider = () => null;\n")
+        _write(workspace, "src/pages/ProductsPage.jsx", "// auth is mentioned once here, unrelated to the filename\nconst x = 1;\n")
+
+        res = search_code(str(workspace), query="auth")
+
+        assert res["success"] is True
+        files_in_order = [m["file"] for m in res["matches"]]
+        assert files_in_order[0] == "src/context/AuthContext.jsx"
+
+
+def test_search_code_surfaces_path_match_even_without_content_match():
+    """A file whose NAME matches the query must be returned even if no
+    single line's content contains the query text at all."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        workspace = Path(tmpdir)
+        _write(
+            workspace, "src/pages/session/LoginPage.jsx",
+            "import React from 'react';\nexport default function LoginPage() { return null; }\n",
+        )
+
+        res = search_code(str(workspace), query="session")
+
+        assert res["success"] is True
+        # "session" never appears in the file's content, only in its path.
+        assert any(m["file"] == "src/pages/session/LoginPage.jsx" for m in res["matches"])
+
+
+def test_search_code_prioritizes_exact_phrase_over_token_only_matches():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        workspace = Path(tmpdir)
+        _write(workspace, "src/exact.js", "// cart subtotal is computed right here\nconst x = 1;\n")
+        _write(workspace, "src/scattered.js", "// the cart has a discount, subtotal shown separately\nconst y = 2;\n")
+
+        res = search_code(str(workspace), query="cart subtotal")
+
+        files_in_order = [m["file"] for m in res["matches"]]
+        assert files_in_order[0] == "src/exact.js"
+
+
+def test_search_code_finds_token_matches_when_no_exact_phrase_exists():
+    """A multi-word query must still find content where the words appear
+    separately, not only an exact phrase match (the old implementation only
+    matched the literal, full query string)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        workspace = Path(tmpdir)
+        _write(workspace, "src/cart.js", "// computes the cart item subtotal for checkout\nconst x = 1;\n")
+
+        res = search_code(str(workspace), query="cart item component")
+
+        assert any(m["file"] == "src/cart.js" for m in res["matches"])
+
+
+def test_search_code_suppresses_package_lock_and_node_modules_noise():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        workspace = Path(tmpdir)
+        _write(workspace, "package-lock.json", '{"name": "react", "dependencies": {"react": "auth-token-string"}}\n')
+        _write(workspace, "node_modules/react/index.js", "module.exports = { auth: true };\n")
+        _write(workspace, "src/AuthContext.jsx", "export const AuthContext = () => null; // auth\n")
+
+        res = search_code(str(workspace), query="auth")
+
+        matched_files = {m["file"] for m in res["matches"]}
+        assert "package-lock.json" not in matched_files
+        assert not any(f.startswith("node_modules/") for f in matched_files)
+        assert "src/AuthContext.jsx" in matched_files
+
+
+def test_search_code_ordering_is_deterministic():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        workspace = Path(tmpdir)
+        for i in range(5):
+            _write(workspace, f"src/file_{i}.js", "const TARGET = 1;\n")
+
+        first = search_code(str(workspace), query="TARGET")
+        second = search_code(str(workspace), query="TARGET")
+
+        assert [m["file"] for m in first["matches"]] == [m["file"] for m in second["matches"]]
+
+
+def test_search_code_file_pattern_still_supported_with_relevance_ranking():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        workspace = Path(tmpdir)
+        _write(workspace, "src/AuthContext.jsx", "export const AuthContext = () => null;\n")
+        _write(workspace, "src/AuthContext.py", "AUTH_CONTEXT = None\n")
+
+        res = search_code(str(workspace), query="AuthContext", file_pattern="*.jsx")
+
+        assert {m["file"] for m in res["matches"]} == {"src/AuthContext.jsx"}

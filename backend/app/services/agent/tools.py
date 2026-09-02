@@ -7,7 +7,29 @@ import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from app.core.logging import logger
+from app.services.indexing.file_discovery import IGNORED_DIRS
 from app.services.verification.engine import VerificationEngine
+
+# Filenames excluded from search_code() regardless of extension/glob match --
+# real source-adjacent text (unlike e.g. package.json) but pure dependency-
+# manifest noise for code investigation. Files ending in ".lock" are already
+# excluded via file_discovery.IGNORED_EXTENSIONS' convention; these don't
+# use that extension so need an explicit name match.
+_SEARCH_NOISE_FILENAMES = {
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+}
+
+# Tokens shorter than this are too generic to score a relevance match on
+# their own (matches _question_terms' >3-character convention in
+# app.services.qa.investigator).
+_MIN_TOKEN_LENGTH = 3
+
+_PATH_EXACT_PHRASE_SCORE = 100
+_PATH_TOKEN_SCORE = 50
+_CONTENT_EXACT_PHRASE_SCORE = 20
+_CONTENT_ALL_TOKENS_SCORE = 10
+_CONTENT_ANY_TOKEN_SCORE = 5
 
 # Source/config extensions searched by default when search_code() is given no
 # explicit file_pattern. Covers every ecosystem the verification adapters
@@ -84,43 +106,107 @@ def list_files(workspace_dir: str, sub_dir: str = ".") -> Dict[str, Any]:
         return {"success": False, "error": str(e), "files": []}
 
 
+def _search_tokens(text: str) -> List[str]:
+    """Split free text into lowercase word tokens, dropping anything too
+    short to be a meaningful relevance signal on its own."""
+    return [t for t in re.split(r"\W+", text.lower()) if len(t) >= _MIN_TOKEN_LENGTH]
+
+
+def _content_relevance(line_lower: str, query_lower: str, tokens: List[str]) -> int:
+    if query_lower and query_lower in line_lower:
+        return _CONTENT_EXACT_PHRASE_SCORE
+    if tokens:
+        hits = sum(1 for t in tokens if t in line_lower)
+        if hits == len(tokens):
+            return _CONTENT_ALL_TOKENS_SCORE
+        if hits > 0:
+            return _CONTENT_ANY_TOKEN_SCORE
+    return 0
+
+
+def _path_relevance(rel_path_lower: str, query_lower: str, tokens: List[str]) -> int:
+    if query_lower and query_lower in rel_path_lower:
+        return _PATH_EXACT_PHRASE_SCORE
+    if tokens and any(t in rel_path_lower for t in tokens):
+        return _PATH_TOKEN_SCORE
+    return 0
+
+
 def search_code(
     workspace_dir: str,
     query: str,
     file_pattern: Optional[Union[str, Sequence[str]]] = None,
 ) -> Dict[str, Any]:
-    """Search for literal text (case-insensitive) in workspace files.
+    """Search for text (case-insensitive) in workspace files, ranked by
+    relevance rather than raw filesystem-walk order.
 
     ``file_pattern`` accepts a single glob (``"*.tsx"``), a list of globs
     (``["*.go", "*.mod"]``), or ``None`` (default) to search across every
     ecosystem's common source extensions plus common config/text files --
     see ``_DEFAULT_SEARCH_GLOBS``. Pass an explicit pattern to narrow the
     search to one language/ecosystem; never assume the repository is Python.
+
+    Relevance ranking (highest first, deterministic ties broken by file
+    path then line number -- never an LLM call, just a fixed scoring rule):
+      1. The file's own path contains the exact query phrase.
+      2. The file's own path contains one of the query's word tokens.
+      3. A line's content contains the exact query phrase.
+      4. A line's content contains every one of the query's word tokens.
+      5. A line's content contains at least one query token.
+    A file whose path matches (1)/(2) is still returned even if no single
+    line's content matches at all (e.g. searching "auth" should surface
+    ``AuthContext.jsx`` by name, not just by grep hits inside it).
+
+    Dependency-manifest noise (node_modules, build/dist output,
+    package-lock.json, and the other directories/extensions
+    app.services.indexing.file_discovery already excludes from indexing)
+    is skipped so common terms don't get crowded out by thousands of lock-
+    file lines.
     """
     try:
         patterns = _normalize_search_patterns(file_pattern)
         base_path = Path(workspace_dir).resolve()
-        matches: List[Dict[str, Any]] = []
+        query_stripped = query.strip()
+        query_lower = query_stripped.lower()
+        tokens = _search_tokens(query_stripped)
+
+        # (score, file, line, content) -- sorted once at the end for
+        # deterministic, relevance-first ordering.
+        candidates: List[Tuple[int, str, int, str]] = []
 
         for root, dirs, files in os.walk(base_path):
-            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ("node_modules", "__pycache__", "venv", ".venv")]
+            dirs[:] = [d for d in dirs if d not in IGNORED_DIRS and not d.startswith(".")]
             for f in files:
-                if any(fnmatch.fnmatch(f, p) for p in patterns):
-                    file_path = Path(root) / f
-                    rel_path = str(file_path.relative_to(base_path)).replace("\\", "/")
-                    try:
-                        with open(file_path, "r", encoding="utf-8", errors="ignore") as fp:
-                            for idx, line in enumerate(fp, start=1):
-                                if query.lower() in line.lower():
-                                    matches.append({
-                                        "file": rel_path,
-                                        "line": idx,
-                                        "content": line.rstrip(),
-                                    })
-                    except Exception:
-                        continue
+                if f in _SEARCH_NOISE_FILENAMES:
+                    continue
+                if not any(fnmatch.fnmatch(f, p) for p in patterns):
+                    continue
 
-        return {"success": True, "query": query, "matches": matches[:50], "total_matches": len(matches)}
+                file_path = Path(root) / f
+                rel_path = str(file_path.relative_to(base_path)).replace("\\", "/")
+                path_score = _path_relevance(rel_path.lower(), query_lower, tokens)
+
+                try:
+                    with open(file_path, "r", encoding="utf-8", errors="ignore") as fp:
+                        file_lines = fp.readlines()
+                except Exception:
+                    continue
+
+                found_content_match = False
+                for idx, line in enumerate(file_lines, start=1):
+                    content_score = _content_relevance(line.lower(), query_lower, tokens)
+                    if content_score > 0:
+                        found_content_match = True
+                        candidates.append((path_score + content_score, rel_path, idx, line.rstrip()))
+
+                if not found_content_match and path_score > 0:
+                    first_line = file_lines[0].rstrip() if file_lines else ""
+                    candidates.append((path_score, rel_path, 1, first_line))
+
+        candidates.sort(key=lambda c: (-c[0], c[1], c[2]))
+        matches = [{"file": f, "line": ln, "content": c} for _, f, ln, c in candidates[:50]]
+
+        return {"success": True, "query": query, "matches": matches, "total_matches": len(candidates)}
     except Exception as e:
         return {"success": False, "error": str(e), "matches": []}
 
