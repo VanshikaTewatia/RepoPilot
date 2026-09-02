@@ -68,3 +68,71 @@ def test_agent_tools_workflow():
         # Verify modification
         final_read = read_file(workspace, "src/service.py")
         assert "modified line 2" in final_read["content"]
+
+
+# ---------------------------------------------------------------------------
+# search_code: multi-language default (Task #15-style regression coverage --
+# the agent's own investigate_node must never be blind to non-Python repos)
+# ---------------------------------------------------------------------------
+def _write(root: Path, rel_path: str, content: str) -> None:
+    target = root / rel_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content, encoding="utf-8")
+
+
+def test_search_code_default_finds_matches_across_languages():
+    """With no file_pattern given, search_code() must search JS/TS/TSX/Go/
+    Rust/Java/C#/Dart files, not just *.py -- the old default silently
+    searched Python only, which is exactly what made investigate_node blind
+    to non-Python repositories."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        workspace = Path(tmpdir)
+        _write(workspace, "src/auth.js", "function login() { return AUTH_TOKEN; }\n")
+        _write(workspace, "src/Auth.tsx", "export function AuthProvider() { return AUTH_TOKEN; }\n")
+        _write(workspace, "src/auth.go", "func Login() string { return AUTH_TOKEN }\n")
+        _write(workspace, "src/Auth.rs", "fn login() -> &'static str { AUTH_TOKEN }\n")
+        _write(workspace, "src/Auth.java", "class Auth { String token = AUTH_TOKEN; }\n")
+        _write(workspace, "src/Auth.cs", "class Auth { string token = AUTH_TOKEN; }\n")
+        _write(workspace, "lib/auth.dart", "String login() => AUTH_TOKEN;\n")
+
+        res = search_code(str(workspace), query="AUTH_TOKEN")
+
+        assert res["success"] is True
+        matched_files = {m["file"] for m in res["matches"]}
+        assert matched_files == {
+            "src/auth.js",
+            "src/Auth.tsx",
+            "src/auth.go",
+            "src/Auth.rs",
+            "src/Auth.java",
+            "src/Auth.cs",
+            "lib/auth.dart",
+        }
+
+
+def test_search_code_explicit_single_pattern_narrows_to_one_language():
+    """An explicit file_pattern still narrows the search exactly as before
+    (e.g. restoring the old Python-only behavior on request)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        workspace = Path(tmpdir)
+        _write(workspace, "a.py", "TARGET = 1\n")
+        _write(workspace, "b.js", "const TARGET = 1;\n")
+
+        res = search_code(str(workspace), query="TARGET", file_pattern="*.py")
+
+        assert res["success"] is True
+        assert {m["file"] for m in res["matches"]} == {"a.py"}
+
+
+def test_search_code_explicit_list_of_patterns():
+    """A list of globs matches the union of those extensions only."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        workspace = Path(tmpdir)
+        _write(workspace, "a.ts", "TARGET\n")
+        _write(workspace, "a.tsx", "TARGET\n")
+        _write(workspace, "a.py", "TARGET\n")
+
+        res = search_code(str(workspace), query="TARGET", file_pattern=["*.ts", "*.tsx"])
+
+        assert res["success"] is True
+        assert {m["file"] for m in res["matches"]} == {"a.ts", "a.tsx"}

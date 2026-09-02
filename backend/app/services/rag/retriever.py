@@ -47,12 +47,23 @@ class CodeRetriever:
         self,
         query: str,
         repository_id: int,
-        top_k: int = 5,
+        top_k: Optional[int] = None,
+        file_prefix: Optional[str] = None,
         db: Optional[AsyncSession] = None,
     ) -> List[RetrievedChunk]:
-        """Perform pgvector cosine similarity search to find relevant code chunks."""
+        """Perform pgvector cosine similarity search to find relevant code chunks.
+
+        ``top_k`` defaults to ``settings.vector_top_k`` when omitted (rather
+        than a hardcoded literal), so the retrieval limit is configurable in
+        one place. ``file_prefix``, when given, scopes results to chunks
+        whose ``file_path`` falls under that project root (e.g. "frontend"
+        in a monorepo) -- omit it (the default) to search the whole
+        repository exactly as before; existing callers are unaffected.
+        """
         if not query.strip() or not db:
             return []
+
+        effective_top_k = top_k if top_k is not None else settings.vector_top_k
 
         # Generate dense query embedding
         try:
@@ -65,14 +76,18 @@ class CodeRetriever:
 
         # Query pgvector for closest chunks by cosine distance
         distance_expr = CodeChunk.embedding.cosine_distance(query_vector)
+        conditions = [
+            CodeChunk.repository_id == repository_id,
+            CodeChunk.embedding.isnot(None),
+        ]
+        if file_prefix and file_prefix != ".":
+            conditions.append(CodeChunk.file_path.startswith(file_prefix.rstrip("/") + "/"))
+
         stmt = (
             select(CodeChunk, distance_expr.label("distance"))
-            .where(
-                CodeChunk.repository_id == repository_id,
-                CodeChunk.embedding.isnot(None),
-            )
+            .where(*conditions)
             .order_by("distance")
-            .limit(top_k)
+            .limit(effective_top_k)
         )
 
         result = await db.execute(stmt)
@@ -100,15 +115,20 @@ class CodeRetriever:
         self,
         query: str,
         repository_id: int,
-        top_k: int = 5,
+        top_k: Optional[int] = None,
+        file_prefix: Optional[str] = None,
         db: Optional[AsyncSession] = None,
     ) -> Dict[str, Any]:
-        """Retrieve relevant code context and generate a grounded answer."""
+        """Retrieve relevant code context and generate a grounded answer.
+
+        See ``retrieve_chunks`` for ``top_k``/``file_prefix`` semantics.
+        """
         try:
             chunks = await self.retrieve_chunks(
                 query=query,
                 repository_id=repository_id,
                 top_k=top_k,
+                file_prefix=file_prefix,
                 db=db,
             )
         except RetrievalError as e:

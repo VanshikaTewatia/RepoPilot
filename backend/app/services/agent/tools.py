@@ -4,10 +4,47 @@ from pathlib import Path
 import fnmatch
 import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from app.core.logging import logger
 from app.services.verification.engine import VerificationEngine
+
+# Source/config extensions searched by default when search_code() is given no
+# explicit file_pattern. Covers every ecosystem the verification adapters
+# recognize (JS/JSX/TS/TSX, Java/Kotlin, Go, Rust, C#, Dart, Python) plus
+# common config/text files -- so a caller that doesn't specify a pattern
+# never silently searches Python only, as happened previously (the old
+# default was "*.py", which made the agent's own investigate_node blind to
+# every non-Python repository).
+_DEFAULT_SEARCH_GLOBS: Tuple[str, ...] = (
+    "*.py",
+    "*.js", "*.jsx", "*.ts", "*.tsx",
+    "*.java", "*.kt",
+    "*.go",
+    "*.rs",
+    "*.cs",
+    "*.dart",
+    "*.rb", "*.php",
+    "*.c", "*.h", "*.cpp", "*.hpp",
+    "*.json", "*.yaml", "*.yml", "*.toml",
+    "*.md",
+)
+
+
+def _normalize_search_patterns(file_pattern: Optional[Union[str, Sequence[str]]]) -> Tuple[str, ...]:
+    """Resolve the ``file_pattern`` argument into a concrete glob tuple.
+
+    ``None`` (the default) means "search every common source/config
+    extension" (``_DEFAULT_SEARCH_GLOBS``). A single string narrows to one
+    glob (e.g. ``"*.py"`` for the old Python-only behavior, or ``"*.tsx"``).
+    A sequence narrows to exactly those globs (e.g. ``["*.go"]`` or
+    ``["*.ts", "*.tsx"]``).
+    """
+    if file_pattern is None:
+        return _DEFAULT_SEARCH_GLOBS
+    if isinstance(file_pattern, str):
+        return (file_pattern,)
+    return tuple(file_pattern)
 
 
 def _resolve_safe_path(base_dir: Path | str, target_rel_path: str) -> Path:
@@ -47,16 +84,28 @@ def list_files(workspace_dir: str, sub_dir: str = ".") -> Dict[str, Any]:
         return {"success": False, "error": str(e), "files": []}
 
 
-def search_code(workspace_dir: str, query: str, file_pattern: str = "*.py") -> Dict[str, Any]:
-    """Search for literal text or regex patterns in workspace files."""
+def search_code(
+    workspace_dir: str,
+    query: str,
+    file_pattern: Optional[Union[str, Sequence[str]]] = None,
+) -> Dict[str, Any]:
+    """Search for literal text (case-insensitive) in workspace files.
+
+    ``file_pattern`` accepts a single glob (``"*.tsx"``), a list of globs
+    (``["*.go", "*.mod"]``), or ``None`` (default) to search across every
+    ecosystem's common source extensions plus common config/text files --
+    see ``_DEFAULT_SEARCH_GLOBS``. Pass an explicit pattern to narrow the
+    search to one language/ecosystem; never assume the repository is Python.
+    """
     try:
+        patterns = _normalize_search_patterns(file_pattern)
         base_path = Path(workspace_dir).resolve()
         matches: List[Dict[str, Any]] = []
 
         for root, dirs, files in os.walk(base_path):
             dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ("node_modules", "__pycache__", "venv", ".venv")]
             for f in files:
-                if fnmatch.fnmatch(f, file_pattern):
+                if any(fnmatch.fnmatch(f, p) for p in patterns):
                     file_path = Path(root) / f
                     rel_path = str(file_path.relative_to(base_path)).replace("\\", "/")
                     try:
