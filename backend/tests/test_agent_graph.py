@@ -511,3 +511,72 @@ def test_gemini_system_prompt_requires_minimality():
     assert len(patches) == 1
     assert patches[0]["file_path"] == "src/order_service.py"
     assert patches[0]["start_line"] == 40
+
+
+# ---------------------------------------------------------------------------
+# Phase 3C fix #2: retrieved-context fences must match the file's real
+# language, not be hardcoded to python for every file.
+# ---------------------------------------------------------------------------
+def test_patch_prompt_uses_language_aware_fence_for_non_python_file():
+    mock_response = MagicMock()
+    mock_response.text = json.dumps([])
+
+    captured = {}
+
+    def capture_generate_content(*args, **kwargs):
+        captured.update(kwargs)
+        return mock_response
+
+    mock_client = MagicMock()
+    mock_client.models.generate_content.side_effect = capture_generate_content
+
+    with patch("app.core.config.settings.gemini_api_key", "real_like_test_key_12345"):
+        with patch("google.genai.Client", return_value=mock_client):
+            _generate_patches_with_gemini(
+                task_description="Fix the cart total display",
+                retrieved_context=[
+                    {
+                        "file_path": "src/components/Cart.jsx",
+                        "content": "function Cart() {\n  return null;\n}\n",
+                        "total_lines": 3,
+                    }
+                ],
+            )
+
+    prompt = captured["contents"]
+    assert "```javascript" in prompt
+    assert "```python" not in prompt
+
+
+def test_patch_prompt_fence_language_covers_multiple_ecosystems_and_unknown_fallback():
+    mock_response = MagicMock()
+    mock_response.text = json.dumps([])
+
+    captured = {}
+
+    def capture_generate_content(*args, **kwargs):
+        captured.update(kwargs)
+        return mock_response
+
+    mock_client = MagicMock()
+    mock_client.models.generate_content.side_effect = capture_generate_content
+
+    with patch("app.core.config.settings.gemini_api_key", "real_like_test_key_12345"):
+        with patch("google.genai.Client", return_value=mock_client):
+            _generate_patches_with_gemini(
+                task_description="Fix the build",
+                retrieved_context=[
+                    {"file_path": "main.go", "content": "package main\n", "total_lines": 1},
+                    {"file_path": "lib.rs", "content": "fn main() {}\n", "total_lines": 1},
+                    {"file_path": "App.tsx", "content": "export default App;\n", "total_lines": 1},
+                    {"file_path": "Makefile", "content": "build:\n\tgo build\n", "total_lines": 2},
+                ],
+            )
+
+    prompt = captured["contents"]
+    assert "### File: main.go (1 lines total)\n```go\n" in prompt
+    assert "### File: lib.rs (1 lines total)\n```rust\n" in prompt
+    assert "### File: App.tsx (1 lines total)\n```typescript\n" in prompt
+    # No mapping entry for an extensionless file -- safe generic fallback,
+    # never the raw (attacker-influenced) filename/extension text itself.
+    assert "### File: Makefile (2 lines total)\n```text\n" in prompt

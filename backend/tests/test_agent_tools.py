@@ -25,6 +25,39 @@ def test_path_traversal_prevention():
             _resolve_safe_path(workspace, "../outside.txt")
 
 
+# ---------------------------------------------------------------------------
+# Phase 3C fix #4: containment must be path-component-wise (Path.parents),
+# not a naive string-prefix check -- a sibling directory that merely shares
+# the workspace directory's name as a text prefix is not actually contained
+# within it.
+# ---------------------------------------------------------------------------
+def test_path_traversal_rejects_sibling_directory_with_prefix_matching_name():
+    with tempfile.TemporaryDirectory() as parent:
+        workspace = Path(parent) / "task_1_abc"
+        workspace.mkdir()
+        sibling = Path(parent) / "task_1_abcXYZ"
+        sibling.mkdir()
+        (sibling / "secret.txt").write_text("should not be reachable\n", encoding="utf-8")
+
+        with pytest.raises(ValueError, match="Path traversal detected"):
+            _resolve_safe_path(workspace, "../task_1_abcXYZ/secret.txt")
+
+
+def test_path_traversal_allows_legitimate_child_and_self_paths():
+    """Normal child paths, and the base directory itself, must continue to
+    resolve without raising."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        workspace = Path(tmpdir)
+        (workspace / "src").mkdir()
+        (workspace / "src" / "file.py").write_text("x = 1\n", encoding="utf-8")
+
+        resolved = _resolve_safe_path(workspace, "src/file.py")
+        assert resolved == (workspace / "src" / "file.py").resolve()
+
+        resolved_self = _resolve_safe_path(workspace, ".")
+        assert resolved_self == workspace.resolve()
+
+
 def test_agent_tools_workflow():
     """Test list_files, read_file, search_code, and apply_patch."""
     with tempfile.TemporaryDirectory() as tmpdir:

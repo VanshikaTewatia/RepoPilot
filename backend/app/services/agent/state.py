@@ -24,6 +24,13 @@ class AgentState(TypedDict, total=False):
     error_analysis: Optional[str]
     is_verified: bool
     messages: List[Dict[str, Any]]
+    # How many of proposed_patches actually applied successfully in the most
+    # recent edit_node pass (distinct from len(proposed_patches), which only
+    # reflects what was *generated*). None when not yet set (e.g. before the
+    # first edit attempt). See app.services.agent.graph.finalize_node --
+    # verification passing with patches proposed but none applied must never
+    # be reported as FIXED.
+    applied_patch_count: Optional[int]
     # Task-level outcome classification, distinct from is_verified/status:
     # "FIXED" | "NO_CHANGE_NEEDED" | "UNABLE_TO_VERIFY" | "FAILED".
     # See app.services.agent.graph.finalize_node.

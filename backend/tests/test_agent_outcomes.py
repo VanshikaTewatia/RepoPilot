@@ -16,7 +16,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from app.services.agent.graph import agent_app, finalize_node
+from app.services.agent.graph import agent_app, edit_node, finalize_node
 
 
 def _base_state(workspace: Path, task_description: str, **overrides) -> dict:
@@ -269,3 +269,89 @@ async def test_outcome_unable_to_verify_when_required_tool_missing():
         assert final_state["outcome"] == "UNABLE_TO_VERIFY"
         assert final_state["test_results"]["ecosystem"] == "java-gradle"
         assert final_state["is_verified"] is False
+
+
+# ---------------------------------------------------------------------------
+# Phase 3C fix #3: zero-applied-patch information must be surfaced, never
+# silently discarded -- a task where every generated patch fails to apply
+# must never be reported identically to one where real edits were made and
+# verification simply failed, and must never be reported as FIXED.
+# ---------------------------------------------------------------------------
+def test_edit_node_reports_zero_applied_patch_count_when_all_apply_patch_calls_fail():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        workspace = Path(tmpdir)
+        (workspace / "a.py").write_text("x = 1\n", encoding="utf-8")
+
+        state = _base_state(
+            workspace,
+            "Fix a.py",
+            proposed_patches=[
+                # Way beyond the 1-line file -- tools.apply_patch's own
+                # bounds check rejects this, so it never applies.
+                {"file_path": "a.py", "code": "x = 2\n", "start_line": 50, "end_line": 51},
+            ],
+        )
+
+        out = edit_node(state)
+
+        assert out["applied_patch_count"] == 0
+
+
+def test_finalize_node_verified_with_zero_applied_patches_is_no_change_needed_not_fixed():
+    """Patches were generated and verification passed, but none of the
+    patches actually applied -- the code was never really changed, so this
+    must never be reported as FIXED."""
+    state = {
+        "test_results": {"available": True, "success": True},
+        "proposed_patches": [{"file_path": "a.py", "code": "x = 1\n"}],
+        "applied_patch_count": 0,
+        "is_verified": True,
+    }
+    out = finalize_node(state)
+
+    assert out["outcome"] == "NO_CHANGE_NEEDED"
+    assert out["outcome"] != "FIXED"
+    assert "none could be applied" in out["outcome_detail"]
+
+
+def test_finalize_node_failed_detail_distinguishes_zero_applied_from_real_edit_failure():
+    """A FAILED outcome where nothing was ever actually applied must read
+    differently from a FAILED outcome where real edits were made and
+    verification still failed -- otherwise the two are indistinguishable to
+    a human reviewer."""
+    zero_applied_state = {
+        "test_results": {"available": True, "success": False},
+        "proposed_patches": [{"file_path": "a.py", "code": "x = 2\n"}],
+        "applied_patch_count": 0,
+        "is_verified": False,
+    }
+    real_edit_failed_state = {
+        "test_results": {"available": True, "success": False},
+        "proposed_patches": [{"file_path": "a.py", "code": "x = 2\n"}],
+        "applied_patch_count": 1,
+        "is_verified": False,
+    }
+
+    zero_applied_out = finalize_node(zero_applied_state)
+    real_edit_out = finalize_node(real_edit_failed_state)
+
+    assert zero_applied_out["outcome"] == "FAILED"
+    assert real_edit_out["outcome"] == "FAILED"
+    assert zero_applied_out["outcome_detail"] != real_edit_out["outcome_detail"]
+    assert "none could be applied" in zero_applied_out["outcome_detail"]
+    assert "none could be applied" not in real_edit_out["outcome_detail"]
+
+
+def test_finalize_node_applied_patch_count_absent_preserves_prior_behavior():
+    """A caller (e.g. a hand-constructed state, matching every finalize_node
+    test that predates this field) that never sets applied_patch_count at
+    all must see byte-identical behavior to before this fix -- only an
+    explicit 0 downgrades an otherwise-FIXED result."""
+    state = {
+        "test_results": {"available": True, "success": True},
+        "proposed_patches": [{"file_path": "a.py", "code": "x = 1\n"}],
+        "is_verified": True,
+    }
+    out = finalize_node(state)
+
+    assert out["outcome"] == "FIXED"

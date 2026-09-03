@@ -302,7 +302,14 @@ def test_verify_python_project_delegates_to_existing_sandbox_and_preserves_behav
         _write(root, "pyproject.toml", "[project]\nname='x'\n")
         _write(root, "test_math.py", "def test_add(): assert 1 + 1 == 2\n")
 
-        result = VerificationEngine().verify(root)
+        engine = VerificationEngine()
+        # Force the subprocess path so this test is deterministic regardless
+        # of whether a real Docker daemon happens to be running/reachable in
+        # the host environment (the sandbox's own real Docker path is
+        # covered separately in test_sandbox.py).
+        engine._docker_runner._docker_checked = True
+        engine._docker_runner._docker_available = False
+        result = engine.verify(root)
 
         assert result["ecosystem"] == "python"
         assert result["success"] is True
@@ -339,6 +346,8 @@ def test_verify_repository_single_project_delegates_exactly_like_verify():
         _write(root, "test_math.py", "def test_add(): assert 1 + 1 == 2\n")
 
         engine = VerificationEngine()
+        engine._docker_runner._docker_checked = True
+        engine._docker_runner._docker_available = False
         result = engine.verify_repository(root, task_description="fix math", keyword_matches=[])
 
         assert result["ecosystem"] == "python"

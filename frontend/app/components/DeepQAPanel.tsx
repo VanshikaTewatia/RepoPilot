@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   CitationRef,
   QAAnswer,
@@ -38,24 +38,45 @@ export default function DeepQAPanel({ selectedRepo }: DeepQAPanelProps) {
   const [isAsking, setIsAsking] = useState(false);
   const [qaError, setQaError] = useState<string | null>(null);
 
+  // Tracks the currently-selected repository id on every render, so an
+  // in-flight request's response can tell whether the user has since
+  // switched repositories (a plain closure variable captured at request
+  // time would always see the *old* selectedRepo it started with).
+  const latestRepoIdRef = useRef<number | null>(selectedRepo?.id ?? null);
+  latestRepoIdRef.current = selectedRepo?.id ?? null;
+
+  // Changing the selected repository alone (without asking a new question)
+  // must not leave the previous repository's answer/error visible.
+  useEffect(() => {
+    setAnswer(null);
+    setQaError(null);
+  }, [selectedRepo?.id]);
+
   const canAsk = !!selectedRepo && question.trim().length > 0 && !isAsking;
 
   const handleAsk = async () => {
     if (!selectedRepo || !question.trim()) return;
 
+    const requestRepoId = selectedRepo.id;
     setIsAsking(true);
     setQaError(null);
     setAnswer(null);
     try {
       const data = await askDeepQA({
         question: question.trim(),
-        repository_id: selectedRepo.id,
+        repository_id: requestRepoId,
       });
-      setAnswer(data);
+      // A stale response for a repository the user has since switched away
+      // from must never overwrite the newly-selected repository's state.
+      if (latestRepoIdRef.current === requestRepoId) {
+        setAnswer(data);
+      }
     } catch (err) {
-      setQaError(
-        isApiError(err) ? err.detail : "Failed to query the codebase."
-      );
+      if (latestRepoIdRef.current === requestRepoId) {
+        setQaError(
+          isApiError(err) ? err.detail : "Failed to query the codebase."
+        );
+      }
     } finally {
       setIsAsking(false);
     }

@@ -57,6 +57,11 @@ const OUTCOME_MESSAGES: Record<string, string> = {
     "No code changes were needed — the reported behavior was already correct, or the claimed issue could not be substantiated against the repository.",
 };
 
+/** Statuses whose generic outcome message hides real, useful detail
+ * (the exact test/verification output, or why verification couldn't run) --
+ * `approved`/`rejected` need no further detail beyond their own message. */
+const SHOW_DETAIL_STATUSES = new Set(["failed", "unable_to_verify", "no_change_needed"]);
+
 interface TaskProgressProps {
   task: Task | null;
   /** True while the synchronous POST /tasks/fix request is still in flight. */
@@ -183,21 +188,34 @@ export default function TaskProgress({
 
       {/* Terminal outcome */}
       {task && isFinalTaskStatus(task.status) && (
-        <div
-          className={`flex items-center justify-between p-4 rounded-lg border ${
-            OUTCOME_STYLES[task.status] ?? "bg-slate-800/40 border-slate-600"
-          }`}
-        >
-          <div className="flex items-center gap-3">
-            <StatusBadge status={task.status} size="lg" />
-            <span className="text-sm text-slate-300">
-              {task.status === "approved"
-                ? task.pr_url
-                  ? "Patch pushed to a new branch and a Pull Request was opened."
-                  : "Patch applied to the original repository."
-                : OUTCOME_MESSAGES[task.status]}
-            </span>
+        <div className="space-y-2">
+          <div
+            className={`flex items-center justify-between p-4 rounded-lg border ${
+              OUTCOME_STYLES[task.status] ?? "bg-slate-800/40 border-slate-600"
+            }`}
+          >
+            <div className="flex items-center gap-3">
+              <StatusBadge status={task.status} size="lg" />
+              <span className="text-sm text-slate-300">
+                {task.status === "approved"
+                  ? task.pr_url
+                    ? "Patch pushed to a new branch and a Pull Request was opened."
+                    : "Patch applied to the original repository."
+                  : OUTCOME_MESSAGES[task.status]}
+              </span>
+            </div>
           </div>
+
+          {SHOW_DETAIL_STATUSES.has(task.status) && task.test_output && (
+            <details className="bg-slate-950 border border-slate-800 rounded-lg overflow-hidden">
+              <summary className="cursor-pointer select-none px-4 py-3 text-xs font-semibold text-slate-400 uppercase tracking-wide hover:text-slate-200">
+                Details
+              </summary>
+              <pre className="px-4 pb-4 text-xs text-slate-300 overflow-x-auto max-h-64 font-mono whitespace-pre-wrap">
+                {task.test_output}
+              </pre>
+            </details>
+          )}
         </div>
       )}
     </div>

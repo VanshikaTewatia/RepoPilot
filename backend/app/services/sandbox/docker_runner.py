@@ -8,17 +8,34 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.config import settings
 from app.core.logging import logger
 
 try:
     import docker
-    from docker.errors import DockerException, APIError
+    from docker.errors import APIError, ContainerError, DockerException
     _DOCKER_LIB_AVAILABLE = True
 except ImportError:
     _DOCKER_LIB_AVAILABLE = False
+
+try:
+    from requests.exceptions import ConnectionError as _RequestsConnectionError
+    from requests.exceptions import ReadTimeout as _RequestsReadTimeout
+    # A read-timeout on Container.wait(timeout=...) is documented as raising
+    # requests.exceptions.ReadTimeout, but on Windows (Docker Desktop's named
+    # -pipe transport) the same timeout instead surfaces as a ConnectionError
+    # wrapping a urllib3 ReadTimeoutError -- see
+    # VerificationEngine._execute_in_docker, which documents the identical,
+    # empirically-confirmed quirk. Both must be treated as our own wait()
+    # timeout, not a daemon-connectivity failure.
+    _DOCKER_WAIT_TIMEOUT_EXCEPTIONS: Tuple[type, ...] = (
+        _RequestsReadTimeout,
+        _RequestsConnectionError,
+    )
+except ImportError:  # pragma: no cover - requests always installed alongside docker
+    _DOCKER_WAIT_TIMEOUT_EXCEPTIONS = ()
 
 # Global cache to prevent repeated failed Docker socket attempts
 _GLOBAL_DOCKER_DISABLED = False
@@ -123,6 +140,20 @@ class DockerTestRunner:
         install has no network and will fail, but pytest still runs
         afterwards so a real bug fix isn't masked by an unrelated install
         failure.
+
+        Execution is bounded by ``self.timeout`` using ``Container.wait
+        (timeout=...)`` (the same approach as
+        ``VerificationEngine._execute_in_docker``): the blocking, single-call
+        ``containers.run(detach=False, ...)`` convenience wrapper has no way
+        to bound how long it blocks, so this uses the equivalent manual
+        create/start/wait/logs/remove sequence instead. That wrapper also
+        raises ``ContainerError`` whenever the container's command exits
+        non-zero -- indistinguishable, to a bare ``except DockerException``,
+        from Docker itself being broken. A failing test (the normal,
+        expected outcome of most self-correction attempts before a real fix
+        lands) must never be treated as "Docker is unavailable"; only a
+        genuine daemon-level failure (unreachable daemon, image pull
+        failure, ...) should disable Docker sandboxing.
         """
         global _GLOBAL_DOCKER_DISABLED
         test_target = test_path if test_path else "."
@@ -140,14 +171,15 @@ class DockerTestRunner:
         else:
             cmd = ["pytest", "-v", "-o", "testpaths=.", test_target]
 
-        try:
-            volumes = {
-                str(workspace): {
-                    "bind": "/workspace",
-                    "mode": "rw",
-                }
+        volumes = {
+            str(workspace): {
+                "bind": "/workspace",
+                "mode": "rw",
             }
+        }
 
+        container = None
+        try:
             container = self._docker_client.containers.run(
                 image=self.image,
                 command=cmd,
@@ -156,29 +188,82 @@ class DockerTestRunner:
                 network_mode=self.network_mode,
                 nano_cpus=int(settings.sandbox_max_cpu * 1e9),
                 mem_limit=f"{settings.sandbox_max_memory_mb}m",
-                detach=False,
-                stdout=True,
-                stderr=True,
-                remove=True,
+                detach=True,
                 user="1000:1000",
             )
-            raw_output = container.decode("utf-8", errors="replace") if isinstance(container, bytes) else str(container)
+
+            try:
+                wait_result = container.wait(timeout=self.timeout)
+            except _DOCKER_WAIT_TIMEOUT_EXCEPTIONS:
+                logger.warning(
+                    f"Docker sandbox run exceeded {self.timeout}s timeout; killing container."
+                )
+                try:
+                    container.kill()
+                except (DockerException, APIError):
+                    pass
+                duration = time.time() - start_time
+                return {
+                    "success": False,
+                    "exit_code": 124,
+                    "output": f"Execution timed out after {self.timeout} seconds.",
+                    "passed": 0,
+                    "failed": 1,
+                    "duration": round(duration, 2),
+                }
+
+            exit_code = wait_result.get("StatusCode", 1)
+            raw = container.logs(stdout=True, stderr=True)
+            raw_output = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
             duration = time.time() - start_time
             parsed = self._parse_pytest_output(raw_output)
 
-            success = (parsed["failed"] == 0 and parsed["passed"] > 0)
+            success = (exit_code == 0 and parsed["failed"] == 0 and parsed["passed"] > 0)
             return {
                 "success": success,
-                "exit_code": 0 if success else 1,
+                "exit_code": exit_code,
+                "output": raw_output,
+                "passed": parsed["passed"],
+                "failed": parsed["failed"],
+                "duration": round(duration, 2),
+            }
+        except ContainerError as e:
+            # Docker successfully ran the container and the command exited
+            # non-zero -- a normal failed-test result (e.g. real pytest
+            # failures), never a signal that Docker itself is broken.
+            # _GLOBAL_DOCKER_DISABLED must never be set for this branch.
+            duration = time.time() - start_time
+            raw_stderr = e.stderr
+            raw_output = (
+                raw_stderr.decode("utf-8", errors="replace")
+                if isinstance(raw_stderr, bytes)
+                else str(raw_stderr or e)
+            )
+            parsed = self._parse_pytest_output(raw_output)
+            return {
+                "success": False,
+                "exit_code": e.exit_status if e.exit_status is not None else 1,
                 "output": raw_output,
                 "passed": parsed["passed"],
                 "failed": parsed["failed"],
                 "duration": round(duration, 2),
             }
         except (DockerException, APIError) as e:
+            # A genuine daemon-level failure (unreachable daemon, image not
+            # pulled/built, connection dropped, ...) -- disable Docker
+            # sandboxing and fall back to the subprocess runner for this and
+            # subsequent calls.
             _GLOBAL_DOCKER_DISABLED = True
             self._docker_available = False
             return self._run_in_subprocess(workspace, test_path, start_time)
+        finally:
+            # Explicit removal (rather than run()'s remove=True/auto_remove)
+            # since detach=True is required to apply our own wait() timeout.
+            if container is not None:
+                try:
+                    container.remove(force=True)
+                except (DockerException, APIError):
+                    pass
 
     def _install_dependencies(self, workspace: Path) -> tuple[str, Optional[str]]:
         """Best-effort install of the repo's dependency manifest for the subprocess fallback.

@@ -104,6 +104,51 @@ def parse_and_validate_patches(raw_text: str, workspace_dir: Optional[str] = Non
     return valid_patches
 
 
+# Markdown fence language per file extension for the patch-generation
+# prompt's retrieved-context blocks. A fixed allow-list, not the raw
+# extension string, so an unusual/malformed file extension can never become
+# arbitrary prompt content -- unrecognized extensions fall back to "text".
+_FENCE_LANGUAGE_BY_EXTENSION: Dict[str, str] = {
+    ".py": "python",
+    ".js": "javascript",
+    ".jsx": "javascript",
+    ".ts": "typescript",
+    ".tsx": "typescript",
+    ".java": "java",
+    ".kt": "kotlin",
+    ".go": "go",
+    ".rs": "rust",
+    ".cs": "csharp",
+    ".dart": "dart",
+    ".vue": "vue",
+    ".html": "html",
+    ".css": "css",
+    ".rb": "ruby",
+    ".php": "php",
+    ".c": "c",
+    ".h": "c",
+    ".cpp": "cpp",
+    ".hpp": "cpp",
+    ".json": "json",
+    ".yaml": "yaml",
+    ".yml": "yaml",
+    ".toml": "toml",
+    ".md": "markdown",
+    ".sh": "bash",
+}
+
+
+def _fence_language_for_path(file_path: str) -> str:
+    """Markdown fence language for a retrieved file's own extension.
+
+    Always resolves to a fixed, known-safe token (never the raw extension
+    string) -- an unrecognized extension falls back to "text" rather than
+    the previous hardcoded "python" for every file regardless of its real
+    language.
+    """
+    return _FENCE_LANGUAGE_BY_EXTENSION.get(Path(file_path).suffix.lower(), "text")
+
+
 def _generate_patches_with_gemini(
     task_description: str,
     retrieved_context: List[Dict[str, Any]],
@@ -119,7 +164,8 @@ def _generate_patches_with_gemini(
         fpath = item.get("file_path", "")
         content = item.get("content", "")
         total_lines = item.get("total_lines", 0)
-        context_parts.append(f"### File: {fpath} ({total_lines} lines total)\n```python\n{content}\n```")
+        fence_lang = _fence_language_for_path(fpath)
+        context_parts.append(f"### File: {fpath} ({total_lines} lines total)\n```{fence_lang}\n{content}\n```")
     context_str = "\n\n".join(context_parts)
 
     system_instruction = (
@@ -330,6 +376,7 @@ def edit_node(state: AgentState) -> Dict[str, Any]:
     return {
         "status": "edited",
         "attempt_count": attempt,
+        "applied_patch_count": applied_count,
     }
 
 
@@ -400,18 +447,40 @@ def finalize_node(state: AgentState) -> Dict[str, Any]:
     - NO_CHANGE_NEEDED: verification passed without any code changes, i.e.
       the reported behavior was already correct or could not be
       substantiated as a bug (the plan step is explicitly instructed to
-      return zero patches in that case).
-    - FIXED: one or more patches were applied and verification passed.
+      return zero patches in that case) -- or one or more patches were
+      *generated* but none of them actually *applied* to the workspace
+      (see ``applied_patch_count`` below), so verification passing still
+      reflects the repository's unmodified state, never a real fix.
+    - FIXED: one or more patches were both generated AND actually applied
+      to the workspace, and verification passed.
     - FAILED: the reported issue could not be verified as fixed within the
-      attempt budget.
+      attempt budget. Distinguishes "patches were generated but none of
+      them could be applied" from a genuine post-edit verification failure
+      via ``applied_patch_count``, so the two are never conflated in the
+      reported detail.
+
+    ``applied_patch_count`` (set by ``edit_node``) is deliberately treated
+    as *unknown* (``None``), not zero, when absent from state -- only an
+    explicit ``0`` downgrades an otherwise-FIXED result, so a caller that
+    never ran a real edit pass (e.g. a unit test constructing state by
+    hand) sees the same behavior as before this field existed.
     """
     test_res = state.get("test_results") or {}
     patches = state.get("proposed_patches") or []
     is_verified = state.get("is_verified", False)
+    applied_count = state.get("applied_patch_count")
+    zero_applied = bool(patches) and applied_count == 0
 
     if not test_res.get("available", True):
         outcome = "UNABLE_TO_VERIFY"
         detail = test_res.get("detail") or "Verification tooling was unavailable for this repository."
+    elif is_verified and zero_applied:
+        outcome = "NO_CHANGE_NEEDED"
+        detail = (
+            f"{len(patches)} patch(es) were generated but none could be applied to "
+            "the workspace, so no code change was actually made -- verification "
+            "passed against the repository's unmodified state."
+        )
     elif is_verified and not patches:
         outcome = "NO_CHANGE_NEEDED"
         detail = (
@@ -420,7 +489,15 @@ def finalize_node(state: AgentState) -> Dict[str, Any]:
         )
     elif is_verified:
         outcome = "FIXED"
-        detail = f"Applied {len(patches)} patch(es) and verification passed."
+        applied_display = applied_count if applied_count is not None else len(patches)
+        detail = f"Applied {applied_display} patch(es) and verification passed."
+    elif zero_applied:
+        outcome = "FAILED"
+        detail = (
+            f"{len(patches)} patch(es) were generated but none could be applied to "
+            "the workspace; the reported issue could not be verified as fixed "
+            "within the attempt budget."
+        )
     else:
         outcome = "FAILED"
         detail = "The reported issue could not be verified as fixed within the attempt budget."

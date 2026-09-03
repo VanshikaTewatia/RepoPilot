@@ -70,13 +70,22 @@ def _normalize_search_patterns(file_pattern: Optional[Union[str, Sequence[str]]]
 
 
 def _resolve_safe_path(base_dir: Path | str, target_rel_path: str) -> Path:
-    """Resolve and validate path within base directory, strictly preventing path traversal."""
+    """Resolve and validate path within base directory, strictly preventing path traversal.
+
+    Containment is checked path-component-wise (``Path.parents``), not via a
+    raw string-prefix comparison -- a naive ``str(resolved).startswith(str
+    (base))`` check would incorrectly accept a sibling directory that merely
+    shares ``base``'s name as a text prefix (e.g. base
+    ``/x/task_1_abc`` would wrongly admit ``/x/task_1_abcXYZ/...``, which is
+    not actually a child of ``base`` at all). Matches the same containment
+    pattern already used by ``WorkspaceManager.cleanup_workspace``.
+    """
     base = Path(base_dir).resolve()
     # Normalize path separators
     clean_rel = os.path.normpath(target_rel_path.strip().lstrip("/\\"))
     resolved = (base / clean_rel).resolve()
 
-    if not str(resolved).startswith(str(base)):
+    if resolved != base and base not in resolved.parents:
         raise ValueError(
             f"Path traversal detected: '{target_rel_path}' is outside the authorized workspace."
         )

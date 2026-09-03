@@ -236,4 +236,47 @@ describe("DeepQAPanel", () => {
       repository_id: 2,
     });
   });
+
+  // Phase 3C fix #5: switching repositories alone must clear the previous
+  // repository's answer, and a stale in-flight response must never
+  // overwrite state for a newly-selected repository.
+  it("clears the answer when the repository changes without asking a new question", async () => {
+    const user = userEvent.setup();
+    askDeepQAMock.mockResolvedValue(baseAnswer({ summary: "Answer from repo A" }));
+    const { rerender } = render(<DeepQAPanel selectedRepo={repo({ id: 1 })} />);
+
+    await user.type(questionInput(), "Question one");
+    await user.click(askButton());
+    expect(await screen.findByText("Answer from repo A")).toBeInTheDocument();
+
+    rerender(<DeepQAPanel selectedRepo={repo({ id: 2 })} />);
+
+    expect(screen.queryByText("Answer from repo A")).not.toBeInTheDocument();
+  });
+
+  it("ignores a stale in-flight response after the repository changes before it resolves", async () => {
+    const user = userEvent.setup();
+    let resolveFirst: (value: QAAnswer) => void = () => {};
+    askDeepQAMock.mockReturnValueOnce(
+      new Promise<QAAnswer>((resolve) => {
+        resolveFirst = resolve;
+      })
+    );
+    const { rerender } = render(<DeepQAPanel selectedRepo={repo({ id: 1 })} />);
+
+    await user.type(questionInput(), "Question for repo A");
+    await user.click(askButton());
+    expect(screen.getByRole("button", { name: /investigating/i })).toBeInTheDocument();
+
+    // Switch repositories while the request for repo A is still in flight.
+    rerender(<DeepQAPanel selectedRepo={repo({ id: 2 })} />);
+
+    // The stale response for repo A now arrives.
+    resolveFirst(baseAnswer({ summary: "Stale answer for repo A" }));
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /ask codebase/i })).toBeInTheDocument()
+    );
+    expect(screen.queryByText("Stale answer for repo A")).not.toBeInTheDocument();
+  });
 });

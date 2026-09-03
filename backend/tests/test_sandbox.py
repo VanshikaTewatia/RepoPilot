@@ -5,7 +5,22 @@ import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+from docker.errors import APIError, ContainerError
+from requests.exceptions import ReadTimeout
+
+import app.services.sandbox.docker_runner as docker_runner_module
 from app.services.sandbox.docker_runner import DockerTestRunner, _detect_dependency_install_args
+
+
+@pytest.fixture(autouse=True)
+def _reset_global_docker_disabled():
+    """_GLOBAL_DOCKER_DISABLED is a module-level cache shared across every
+    DockerTestRunner instance -- never let one test's simulated Docker
+    outage leak into another test in this file."""
+    docker_runner_module._GLOBAL_DOCKER_DISABLED = False
+    yield
+    docker_runner_module._GLOBAL_DOCKER_DISABLED = False
 
 
 def _fake_completed(returncode: int, stdout: str = "", stderr: str = "") -> MagicMock:
@@ -14,6 +29,15 @@ def _fake_completed(returncode: int, stdout: str = "", stderr: str = "") -> Magi
     result.stdout = stdout
     result.stderr = stderr
     return result
+
+
+def _fake_container(status_code: int = 0, logs: bytes = b"1 passed in 0.01s") -> MagicMock:
+    """Stands in for the docker-py ``Container`` object returned by
+    ``containers.run(detach=True, ...)``."""
+    container = MagicMock()
+    container.wait.return_value = {"StatusCode": status_code}
+    container.logs.return_value = logs
+    return container
 
 
 def test_sandbox_pytest_output_parser():
@@ -110,6 +134,8 @@ def test_subprocess_installs_requirements_before_running_pytest():
             return _fake_completed(0, stdout="1 passed in 0.01s\n")
 
         runner = DockerTestRunner()
+        runner._docker_checked = True
+        runner._docker_available = False  # force the subprocess path under test
         with patch("app.services.sandbox.docker_runner.subprocess.run", side_effect=fake_run):
             result = runner.run_tests(workspace)
 
@@ -137,6 +163,8 @@ def test_subprocess_install_failure_does_not_block_pytest():
             return _fake_completed(0, stdout="1 passed in 0.01s\n")
 
         runner = DockerTestRunner()
+        runner._docker_checked = True
+        runner._docker_available = False  # force the subprocess path under test
         with patch("app.services.sandbox.docker_runner.subprocess.run", side_effect=fake_run):
             result = runner.run_tests(workspace)
 
@@ -158,6 +186,8 @@ def test_subprocess_skips_install_step_when_no_manifest_present():
             return _fake_completed(0, stdout="1 passed in 0.01s\n")
 
         runner = DockerTestRunner()
+        runner._docker_checked = True
+        runner._docker_available = False  # force the subprocess path under test
         with patch("app.services.sandbox.docker_runner.subprocess.run", side_effect=fake_run):
             runner.run_tests(workspace)
 
@@ -180,6 +210,8 @@ def test_subprocess_install_target_dir_is_removed_after_run():
         (workspace / "test_math.py").write_text("def test_add(): assert 1 + 1 == 2\n", encoding="utf-8")
 
         runner = DockerTestRunner()
+        runner._docker_checked = True
+        runner._docker_available = False  # force the subprocess path under test
         with patch(
             "app.services.sandbox.docker_runner.subprocess.run",
             side_effect=lambda cmd, **kwargs: _fake_completed(0, stdout="1 passed\n"),
@@ -200,7 +232,7 @@ def test_docker_command_installs_dependencies_and_passes_test_target_safely():
 
         runner = DockerTestRunner()
         mock_client = MagicMock()
-        mock_client.containers.run.return_value = b"1 passed in 0.01s"
+        mock_client.containers.run.return_value = _fake_container(0, b"1 passed in 0.01s")
         runner._docker_client = mock_client
 
         malicious_test_path = "tests/test_x.py; rm -rf /"
@@ -215,6 +247,12 @@ def test_docker_command_installs_dependencies_and_passes_test_target_safely():
         assert malicious_test_path not in command[2]
         assert command[-1] == malicious_test_path
         assert result["success"] is True
+        # detach=True is required so a real timeout (Container.wait) can be
+        # enforced; the old blocking, non-timeoutable run() must not return.
+        assert mock_client.containers.run.call_args.kwargs["detach"] is True
+        # The container is explicitly removed rather than relying on
+        # run()'s remove=True/auto_remove (incompatible with detach=True).
+        mock_client.containers.run.return_value.remove.assert_called_once_with(force=True)
 
 
 def test_docker_command_skips_install_when_no_manifest_present():
@@ -223,10 +261,103 @@ def test_docker_command_skips_install_when_no_manifest_present():
 
         runner = DockerTestRunner()
         mock_client = MagicMock()
-        mock_client.containers.run.return_value = b"1 passed in 0.01s"
+        mock_client.containers.run.return_value = _fake_container()
         runner._docker_client = mock_client
 
         runner._run_in_docker(workspace, None, time.time())
 
         command = mock_client.containers.run.call_args.kwargs["command"]
         assert command == ["pytest", "-v", "-o", "testpaths=.", "."]
+
+
+# ---------------------------------------------------------------------------
+# ContainerError (a failing test, NOT a broken Docker daemon) must never
+# disable Docker sandboxing -- Phase 3C hardening fix #1.
+# ---------------------------------------------------------------------------
+def test_container_error_reports_normal_failure_without_disabling_docker():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        workspace = Path(tmpdir)
+
+        runner = DockerTestRunner()
+        mock_client = MagicMock()
+        mock_client.containers.run.side_effect = ContainerError(
+            container="fake-container-id",
+            exit_status=1,
+            command="pytest",
+            image="python:3.11-slim",
+            stderr=b"1 failed in 0.02s",
+        )
+        runner._docker_client = mock_client
+        # Simulate an already-successful availability probe so we can prove
+        # it survives untouched (assertion (c) below).
+        runner._docker_checked = True
+        runner._docker_available = True
+
+        result = runner._run_in_docker(workspace, None, time.time())
+
+        # (a) reported as a normal failed-test result, not a runner error
+        assert result["success"] is False
+        assert result["failed"] == 1
+        assert result["exit_code"] == 1
+
+        # (b) the process-wide flag must remain untouched
+        assert docker_runner_module._GLOBAL_DOCKER_DISABLED is False
+
+        # (c) Docker is still considered available for this runner
+        assert runner.is_docker_available is True
+
+        # (d) subsequent execution still goes through Docker, not the
+        # subprocess fallback -- reconfigure the same mock to succeed and
+        # confirm the Docker path (not subprocess) produced the result.
+        mock_client.containers.run.side_effect = None
+        mock_client.containers.run.return_value = _fake_container(0, b"1 passed in 0.01s")
+        second = runner._run_in_docker(workspace, None, time.time())
+        assert second["success"] is True
+        assert second["passed"] == 1
+
+
+def test_genuine_docker_api_error_disables_docker_and_falls_back_to_subprocess():
+    """A real daemon-level failure (unreachable daemon, image not pulled,
+    connection dropped, ...) is the one case that should still disable
+    Docker sandboxing and degrade to the subprocess fallback."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        workspace = Path(tmpdir)
+        (workspace / "test_math.py").write_text("def test_add(): assert 1 + 1 == 2\n", encoding="utf-8")
+
+        runner = DockerTestRunner()
+        mock_client = MagicMock()
+        mock_client.containers.run.side_effect = APIError("Cannot connect to the Docker daemon")
+        runner._docker_client = mock_client
+
+        with patch(
+            "app.services.sandbox.docker_runner.subprocess.run",
+            side_effect=lambda cmd, **kwargs: _fake_completed(0, stdout="1 passed in 0.01s\n"),
+        ):
+            result = runner._run_in_docker(workspace, None, time.time())
+
+        assert docker_runner_module._GLOBAL_DOCKER_DISABLED is True
+        assert runner._docker_available is False
+        # The subprocess fallback still ran and produced a real result.
+        assert result["success"] is True
+
+
+def test_docker_execution_timeout_kills_container_and_reports_timeout():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        workspace = Path(tmpdir)
+
+        runner = DockerTestRunner(timeout=5)
+        mock_client = MagicMock()
+        fake_container = MagicMock()
+        fake_container.wait.side_effect = ReadTimeout("timed out waiting for container")
+        mock_client.containers.run.return_value = fake_container
+        runner._docker_client = mock_client
+
+        result = runner._run_in_docker(workspace, None, time.time())
+
+        assert result["success"] is False
+        assert result["exit_code"] == 124
+        assert "timed out after 5 seconds" in result["output"].lower()
+        fake_container.kill.assert_called_once()
+        fake_container.remove.assert_called_once_with(force=True)
+        # A timeout is not a Docker-daemon failure.
+        assert docker_runner_module._GLOBAL_DOCKER_DISABLED is False
