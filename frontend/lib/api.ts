@@ -66,6 +66,32 @@ export interface RagAnswer {
   citations: string[];
 }
 
+export interface CitationRef {
+  file_path: string;
+  start_line: number;
+  end_line: number;
+  symbol_name: string | null;
+}
+
+export interface FlowStep {
+  order: number;
+  description: string;
+  file_path: string;
+  citation: CitationRef | null;
+}
+
+export type QAConfidence = "direct_evidence" | "inferred" | "no_evidence";
+
+export interface QAAnswer {
+  summary: string;
+  details: string | null;
+  flow_trace: FlowStep[] | null;
+  evidence: CitationRef[];
+  corrected_premise: string | null;
+  confidence: QAConfidence;
+  projects_considered: string[];
+}
+
 export interface TaskReviewResult {
   task_id: number;
   status: string;
@@ -184,6 +210,22 @@ export function askCodebase(payload: {
     "/rag/ask",
     jsonInit("POST", { top_k: 5, ...payload })
   );
+}
+
+// ---------------------------------------------------------------------------
+// Deep Codebase Q&A
+// ---------------------------------------------------------------------------
+
+/**
+ * Request contains ONLY `question` and `repository_id` -- no workspace/local
+ * path field exists on this type, matching the backend's QAAskRequest. The
+ * server resolves the repository's filesystem location itself.
+ */
+export function askDeepQA(payload: {
+  question: string;
+  repository_id: number;
+}): Promise<QAAnswer> {
+  return request<QAAnswer>("/qa/ask", jsonInit("POST", payload));
 }
 
 // ---------------------------------------------------------------------------
