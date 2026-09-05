@@ -311,7 +311,14 @@ async def test_full_graph_reaches_fixed_when_baseline_reproduced_and_fix_verifie
 
         plan = _applicable_plan()
         bridge_result = _executable_bridge_result(str(workspace))
-        reproduce_result = BaselineResult(status=BaselineStatus.REPRODUCED, detail="reproduced", exit_code=1)
+        # Phase 5: reproduce() is called twice -- once by baseline_node
+        # (pre-fix, REPRODUCED) and once by post_fix_reproduction_node
+        # (post-fix, must confirm the failure is gone) -- side_effect
+        # supplies the two calls in that exact order.
+        baseline_reproduce_result = BaselineResult(status=BaselineStatus.REPRODUCED, detail="reproduced", exit_code=1)
+        post_fix_reproduce_result = BaselineResult(
+            status=BaselineStatus.NOT_REPRODUCED, detail="no longer reproduces", exit_code=0
+        )
 
         initial_state = _base_state(workspace, "The add() function in math_lib.py returns the wrong result.")
 
@@ -320,11 +327,13 @@ async def test_full_graph_reaches_fixed_when_baseline_reproduced_and_fix_verifie
         ), patch("app.services.agent.graph.plan_reproduction", return_value=plan), patch(
             "app.services.agent.graph.build_reproduction_input", return_value=bridge_result
         ), patch(
-            "app.services.agent.graph.reproduce", return_value=reproduce_result
+            "app.services.agent.graph.reproduce",
+            side_effect=[baseline_reproduce_result, post_fix_reproduce_result],
         ):
             final_state = await agent_app.ainvoke(initial_state)
 
         assert final_state["baseline_status"] == "REPRODUCED"
+        assert final_state["post_fix_reproduction_status"] == "NOT_REPRODUCED"
         assert final_state["outcome"] == "FIXED"
         assert "return a + b" in code_file.read_text(encoding="utf-8")
 
@@ -397,9 +406,25 @@ def test_finalize_node_not_reproduced_baseline_never_yields_fixed_or_no_change_n
 
 
 def test_finalize_node_reproduced_baseline_allows_fixed():
-    state = _verified_with_applied_patch_state(baseline_status="REPRODUCED")
+    """Phase 5: a REPRODUCED baseline additionally requires the targeted
+    post-fix reproduction to have positively confirmed the failure is gone
+    before FIXED can be claimed."""
+    state = _verified_with_applied_patch_state(
+        baseline_status="REPRODUCED",
+        post_fix_reproduction_status="NOT_REPRODUCED",
+    )
     out = finalize_node(state)
     assert out["outcome"] == "FIXED"
+
+
+def test_finalize_node_reproduced_baseline_without_post_fix_confirmation_never_yields_fixed():
+    """A REPRODUCED baseline with NO post-fix confirmation at all (e.g.
+    post_fix_reproduction_node never ran for this attempt) must not default
+    to FIXED just because the general test suite passed."""
+    state = _verified_with_applied_patch_state(baseline_status="REPRODUCED")
+    out = finalize_node(state)
+    assert out["outcome"] != "FIXED"
+    assert out["outcome"] == "UNABLE_TO_VERIFY"
 
 
 def test_finalize_node_not_applicable_baseline_allows_fixed():

@@ -54,3 +54,26 @@ class AgentState(TypedDict, total=False):
     # Human-readable explanation of baseline_status, always set regardless
     # of whether execution happened.
     baseline_detail: Optional[str]
+    # Phase 5: the exact validated execution specification (a minimal,
+    # JSON-safe serialization of the ReproductionInput actually run for
+    # baseline reproduction -- see
+    # app.services.agent.graph._reproduction_input_to_state_dict) retained
+    # ONLY so post_fix_reproduction_node can rerun the IDENTICAL procedure
+    # after an edit is applied -- never a new plan, never regenerated
+    # commands/image/working_dir. None whenever baseline never reached a
+    # real execution (NOT_APPLICABLE / UNABLE_TO_REPRODUCE / planning
+    # failure). Deliberately excludes command output -- that lives in
+    # baseline_result / post_fix_reproduction_result, each already bounded
+    # by Phase 4A.
+    reproduction_spec: Optional[Dict[str, Any]]
+    # Phase 5: outcome of rerunning reproduction_spec after edit_node
+    # applies a candidate fix -- "REPRODUCED" (the previously-established
+    # failure is still present) | "NOT_REPRODUCED" (no longer observed) |
+    # "UNABLE_TO_REPRODUCE". Only ever set when baseline_status ==
+    # "REPRODUCED" and this attempt's own test/verify already passed; see
+    # app.services.agent.graph.post_fix_reproduction_node. finalize_node is
+    # the only place this is allowed to gate FIXED -- it can prevent FIXED,
+    # never manufacture it on its own.
+    post_fix_reproduction_status: Optional[str]
+    post_fix_reproduction_result: Optional[Dict[str, Any]]
+    post_fix_reproduction_detail: Optional[str]

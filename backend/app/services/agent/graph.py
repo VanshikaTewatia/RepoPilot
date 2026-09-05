@@ -14,7 +14,10 @@ from app.services.agent import tools
 from app.services.baseline import (
     BridgeOutcome,
     EvidenceReference,
+    ExitCodeSemantics,
     KnownCommand,
+    ReproductionExpectation,
+    ReproductionInput,
     RepositoryEvidence,
     build_reproduction_input,
     plan_reproduction,
@@ -395,6 +398,47 @@ def _build_repository_evidence(state: AgentState) -> RepositoryEvidence:
     )
 
 
+def _reproduction_input_to_state_dict(ri: ReproductionInput) -> Dict[str, Any]:
+    """Minimal, JSON-safe serialization of the validated execution
+    specification actually run for baseline reproduction (Phase 5) --
+    deliberately excludes any command OUTPUT (that lives in baseline_result
+    /post_fix_reproduction_result, each already bounded by Phase 4A) so only
+    the small, reusable specification itself is retained in graph state."""
+    return {
+        "workspace_path": ri.workspace_path,
+        "commands": ri.commands,
+        "working_dir": ri.working_dir,
+        "timeout_seconds": ri.timeout_seconds,
+        "image": ri.image,
+        "expectation": {
+            "exit_code_semantics": ri.expectation.exit_code_semantics.value,
+            "reproduced_output_pattern": ri.expectation.reproduced_output_pattern,
+            "not_reproduced_output_pattern": ri.expectation.not_reproduced_output_pattern,
+        },
+        "task_context": ri.task_context,
+    }
+
+
+def _reproduction_input_from_state_dict(data: Dict[str, Any]) -> ReproductionInput:
+    """Reconstruct the EXACT ReproductionInput previously validated and
+    executed for baseline reproduction -- never regenerated, re-planned, or
+    guessed; see ``_reproduction_input_to_state_dict``, its only producer."""
+    expectation_data = data.get("expectation") or {}
+    return ReproductionInput(
+        workspace_path=data["workspace_path"],
+        commands=data.get("commands") or [],
+        working_dir=data.get("working_dir"),
+        timeout_seconds=data.get("timeout_seconds"),
+        image=data.get("image"),
+        expectation=ReproductionExpectation(
+            exit_code_semantics=ExitCodeSemantics(expectation_data.get("exit_code_semantics", "ignore")),
+            reproduced_output_pattern=expectation_data.get("reproduced_output_pattern"),
+            not_reproduced_output_pattern=expectation_data.get("not_reproduced_output_pattern"),
+        ),
+        task_context=data.get("task_context"),
+    )
+
+
 async def baseline_node(state: AgentState) -> Dict[str, Any]:
     """Establish, before any fix is attempted, whether the reported bug can
     be independently demonstrated against the isolated task workspace.
@@ -406,9 +450,16 @@ async def baseline_node(state: AgentState) -> Dict[str, Any]:
     UNABLE_TO_REPRODUCE here, never silently reinterpreted as NOT_APPLICABLE
     (which is reserved for a genuine "no evidence-backed reproduction
     exists" verdict) or as any positive/negative claim about the bug.
+
+    Whenever the bridge actually produces an executable ``ReproductionInput``
+    (regardless of what executing it returns), its specification is
+    retained verbatim in ``reproduction_spec`` (Phase 5) -- see
+    ``post_fix_reproduction_node``, which reruns exactly this after an edit
+    is applied, never a newly-planned reproduction.
     """
     workspace = state["workspace_dir"]
     task_description = state.get("task_description", "")
+    reproduction_spec: Optional[Dict[str, Any]] = None
 
     try:
         evidence = _build_repository_evidence(state)
@@ -425,6 +476,7 @@ async def baseline_node(state: AgentState) -> Dict[str, Any]:
             elif bridge_result.outcome == BridgeOutcome.NOT_APPLICABLE:
                 status, result, detail = "NOT_APPLICABLE", None, bridge_result.detail
             else:
+                reproduction_spec = _reproduction_input_to_state_dict(bridge_result.reproduction_input)
                 baseline_result = reproduce(bridge_result.reproduction_input)
                 status = baseline_result.status.value
                 result = baseline_result.to_dict()
@@ -439,6 +491,7 @@ async def baseline_node(state: AgentState) -> Dict[str, Any]:
         "baseline_status": status,
         "baseline_result": result,
         "baseline_detail": detail,
+        "reproduction_spec": reproduction_spec,
         "messages": state.get("messages", []) + [{"role": "agent", "content": message}],
     }
 
@@ -581,6 +634,64 @@ def verify_node(state: AgentState) -> Dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Phase 5: targeted post-fix reproduction.
+#
+# Closes the evidence gap a REPRODUCED baseline leaves open: a passing full
+# test suite establishes the *general* verification semantics already
+# present in this project, but never re-confirms that the SPECIFIC failure
+# baseline demonstrated is actually gone. This node reruns the EXACT
+# ReproductionInput captured in reproduction_spec -- never a new plan, never
+# regenerated commands/image/working_dir/timeout -- through the same Phase
+# 4A `reproduce()` entry point baseline_node already uses. No second
+# executor, no direct Docker access, no new workspace.
+#
+# Positioned after verify (not unconditionally after every edit) so it only
+# ever does real work on an attempt whose own mechanical verification
+# already passed AND whose baseline was REPRODUCED -- every other attempt/
+# task is a single dict-lookup no-op. should_continue's retry-routing logic
+# is intentionally NOT modified: it still routes solely on is_verified, so
+# no new retry semantics are invented here (a still-reproducing post-fix
+# result is instead caught by finalize_node, which is the only place this
+# is allowed to prevent -- never manufacture -- a FIXED claim).
+# ---------------------------------------------------------------------------
+async def post_fix_reproduction_node(state: AgentState) -> Dict[str, Any]:
+    """Rerun reproduction_spec (if any) against the isolated workspace after
+    edit_node applied this attempt's candidate fix.
+
+    A fast no-op unless baseline_status == "REPRODUCED" and this attempt's
+    own verification already passed -- every task/attempt without a
+    REPRODUCED baseline, and every failing attempt (which is already headed
+    back to analyze_failure or to a FAILED finalize regardless of this
+    node), is completely unaffected.
+    """
+    if state.get("baseline_status") != "REPRODUCED":
+        return {}
+    if not state.get("is_verified"):
+        return {}
+    spec = state.get("reproduction_spec")
+    if not spec:
+        return {}
+
+    try:
+        reproduction_input = _reproduction_input_from_state_dict(spec)
+        result = reproduce(reproduction_input)
+        status = result.status.value
+        result_dict = result.to_dict()
+        detail = result.detail
+    except Exception as e:  # noqa: BLE001 -- a post-fix integration failure must never crash the task, and must never be silently treated as "the failure is gone"
+        logger.warning(f"Post-fix reproduction failed unexpectedly: {e}")
+        status, result_dict, detail = "UNABLE_TO_REPRODUCE", None, f"Post-fix reproduction failed unexpectedly: {e}"
+
+    message = f"Post-fix reproduction: {status} -- {detail}"
+    return {
+        "post_fix_reproduction_status": status,
+        "post_fix_reproduction_result": result_dict,
+        "post_fix_reproduction_detail": detail,
+        "messages": state.get("messages", []) + [{"role": "agent", "content": message}],
+    }
+
+
 def analyze_failure_node(state: AgentState) -> Dict[str, Any]:
     """Analyze test failure output to refine the next edit attempt."""
     test_res = state.get("test_results") or {}
@@ -650,6 +761,19 @@ def finalize_node(state: AgentState) -> Dict[str, Any]:
     ``baseline_status`` -- including when it is absent entirely (``None``,
     e.g. a hand-constructed state, or any task predating this integration),
     which behaves identically to before this field existed.
+
+    ``post_fix_reproduction_status`` (Phase 5, set by
+    ``post_fix_reproduction_node``) applies one further, narrower gate: when
+    ``baseline_status == "REPRODUCED"`` (the reported failure WAS
+    independently demonstrated before the edit), reaching FIXED additionally
+    requires the SAME reproduction to have positively stopped reproducing
+    after the edit (``post_fix_reproduction_status == "NOT_REPRODUCED"``).
+    Still reproducing, unable to re-check, or never actually re-checked
+    (``None`` -- e.g. ``post_fix_reproduction_node`` itself never ran for
+    this attempt) all block FIXED here -- a general passing test suite is
+    never sufficient by itself to claim the *specific* previously-reproduced
+    failure is gone. This never widens which tasks can reach FIXED, only
+    narrows the one REPRODUCED case further.
     """
     test_res = state.get("test_results") or {}
     patches = state.get("proposed_patches") or []
@@ -657,6 +781,7 @@ def finalize_node(state: AgentState) -> Dict[str, Any]:
     applied_count = state.get("applied_patch_count")
     zero_applied = bool(patches) and applied_count == 0
     baseline_status = state.get("baseline_status")
+    post_fix_status = state.get("post_fix_reproduction_status")
 
     if not test_res.get("available", True):
         outcome = "UNABLE_TO_VERIFY"
@@ -711,6 +836,32 @@ def finalize_node(state: AgentState) -> Dict[str, Any]:
             "reproduction procedure may not have captured it -- so this is not "
             "reported as a confirmed fix."
         )
+    elif is_verified and baseline_status == "REPRODUCED" and post_fix_status != "NOT_REPRODUCED":
+        # Baseline independently demonstrated the reported failure before
+        # the edit. A passing general test suite alone does not establish
+        # that THIS SPECIFIC failure is gone -- only rerunning the exact
+        # same reproduction (post_fix_reproduction_node) can. Still
+        # reproducing is a definitive "not fixed"; unable to re-check (or
+        # never re-checked at all) is an inconclusive "not fixed either" --
+        # neither may become FIXED.
+        if post_fix_status == "REPRODUCED":
+            outcome = "FAILED"
+            detail = (
+                "The patch applied and the full test suite passed, but the SAME "
+                "targeted reproduction that established this issue before the fix "
+                "still demonstrates it afterward "
+                f"({state.get('post_fix_reproduction_detail') or 'failure still observed'}). "
+                "The reported issue has not been fixed."
+            )
+        else:
+            outcome = "UNABLE_TO_VERIFY"
+            detail = (
+                "The patch applied and the full test suite passed, but the targeted "
+                "post-fix reproduction could not confirm the previously-established "
+                "failure is gone "
+                f"({state.get('post_fix_reproduction_detail') or 'post-fix reproduction did not run or was inconclusive'}). "
+                "This is not evidence the fix is correct or incorrect."
+            )
     elif is_verified:
         outcome = "FIXED"
         applied_display = applied_count if applied_count is not None else len(patches)
@@ -743,6 +894,7 @@ def build_agent_graph():
     builder.add_node("edit", edit_node)
     builder.add_node("test", test_node)
     builder.add_node("verify", verify_node)
+    builder.add_node("post_fix_reproduction", post_fix_reproduction_node)
     builder.add_node("analyze_failure", analyze_failure_node)
     builder.add_node("finalize", finalize_node)
 
@@ -753,9 +905,10 @@ def build_agent_graph():
     builder.add_edge("plan", "edit")
     builder.add_edge("edit", "test")
     builder.add_edge("test", "verify")
+    builder.add_edge("verify", "post_fix_reproduction")
 
     builder.add_conditional_edges(
-        "verify",
+        "post_fix_reproduction",
         should_continue,
         {
             "human_approval": "finalize",
