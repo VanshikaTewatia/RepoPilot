@@ -447,8 +447,15 @@ def test_investigate_persists_keyword_matches():
         assert out["keyword_matches"][0]["file"] == "zzz_vip.py"
 
 
-def test_retrieval_ranks_relevant_files_first():
-    """A relevant file must outrank alphabetically earlier irrelevant fillers."""
+@pytest.mark.asyncio
+async def test_retrieval_ranks_relevant_files_first():
+    """A relevant file must outrank alphabetically earlier irrelevant fillers.
+
+    No repository_id is set in state, so Phase 6B's semantic retrieval
+    short-circuits before ever touching a DB/retriever -- this proves
+    ranking stays byte-identical to the pre-Phase-6B keyword-only
+    behavior when semantic retrieval is inapplicable.
+    """
     files = {
         "a_alpha.py": "filler value\n",
         "b_beta.py": "filler value\n",
@@ -464,7 +471,7 @@ def test_retrieval_ranks_relevant_files_first():
         inv = investigate_node(state)
         assert inv["keyword_matches"], "expected investigation matches"
 
-        out = retrieve_node({**state, **inv})
+        out = await retrieve_node({**state, **inv})
         retrieved_paths = [item["file_path"] for item in out["retrieved_context"]]
 
         # Limit is still 5; the relevant file ranks first even though it sorts last
@@ -473,7 +480,8 @@ def test_retrieval_ranks_relevant_files_first():
         assert "e_epsilon.py" not in retrieved_paths
 
 
-def test_retrieval_ties_break_alphabetically():
+@pytest.mark.asyncio
+async def test_retrieval_ties_break_alphabetically():
     """Equal match counts keep deterministic alphabetical ordering."""
     files = {
         "m_mid.py": "plain content\n",
@@ -485,13 +493,14 @@ def test_retrieval_ties_break_alphabetically():
         state = {"workspace_dir": str(workspace), "task_description": "Add widget support"}
 
         inv = investigate_node(state)
-        out = retrieve_node({**state, **inv})
+        out = await retrieve_node({**state, **inv})
         retrieved_paths = [item["file_path"] for item in out["retrieved_context"]]
 
         assert retrieved_paths == ["aaa_z.py", "zzz_a.py", "m_mid.py"]
 
 
-def test_retrieval_without_matches_keeps_alphabetical_order():
+@pytest.mark.asyncio
+async def test_retrieval_without_matches_keeps_alphabetical_order():
     """No investigation data falls back to the previous alphabetical slice."""
     files = {
         "b_beta.py": "one\n",
@@ -502,7 +511,7 @@ def test_retrieval_without_matches_keeps_alphabetical_order():
         workspace = _make_ranking_workspace(tmpdir, files)
         state = {"workspace_dir": str(workspace)}  # no task_description/keyword_matches
 
-        out = retrieve_node(state)
+        out = await retrieve_node(state)
         retrieved_paths = [item["file_path"] for item in out["retrieved_context"]]
 
         assert retrieved_paths == ["a_alpha.py", "b_beta.py", "c_gamma.py"]

@@ -25,6 +25,8 @@ from app.services.baseline import (
 )
 from app.services.verification.project_analyzer import ProjectInfo, RepositoryAnalyzer, select_relevant_projects
 from app.services.diagnosis import diagnose, DiagnosisStatus
+from app.services.agent.db import open_session
+from app.services.rag.retriever import CodeRetriever, RetrievalError, RetrievedChunk
 
 
 def validate_patch(patch: Any, workspace_dir: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -534,18 +536,172 @@ async def baseline_node(state: AgentState) -> Dict[str, Any]:
 
 RETRIEVAL_LIMIT = 5
 
+# ---------------------------------------------------------------------------
+# Phase 6B: semantic candidate-file selection for retrieve_node.
+#
+# Upgrades WHICH files retrieve_node reads, never WHAT is stored about them
+# or how they're read: retrieved_context's shape (full-file reads, real
+# on-disk line numbers) is completely unchanged, so plan_node/edit_node/
+# diagnose_node/diagnoser.py need no changes at all. Semantic retrieval is
+# purely an additional, bounded, best-effort source of candidate file
+# paths merged ahead of the existing keyword-derived ranking; any failure
+# (no repository_id, no DB session, RAG/embedding failure, empty index)
+# degrades to exactly the pre-Phase-6B keyword-only ranking, never raises,
+# and never blocks retrieval.
+# ---------------------------------------------------------------------------
 
-def retrieve_node(state: AgentState) -> Dict[str, Any]:
+# Small, fixed cap on how many detected projects a single retrieve_node pass
+# ever issues a semantic query against -- mirrors app.services.qa.
+# investigator.MAX_PROJECTS_INVESTIGATED's "small fixed budget, even when
+# project selection is completely ambiguous" rationale, applied here for
+# the agent's own (already more localized) retrieval.
+SEMANTIC_MAX_PROJECTS = 2
+
+# Fixed top_k for the agent's own semantic query -- matches
+# app.services.qa.investigator's "targeted" depth tier, never the caller-
+# configurable settings.vector_top_k default.
+SEMANTIC_TOP_K = 8
+
+
+def _semantic_query_text(task_description: str, error_analysis: Optional[str]) -> str:
+    """Query text for semantic retrieval -- includes the CURRENT
+    error_analysis when present, so a retry's semantic search reflects why
+    the previous attempt failed, not just the original task description.
+    Recomputed fresh on every retrieve_node call, never cached across
+    retries."""
+    if error_analysis:
+        return f"{task_description}\n\n{error_analysis}"
+    return task_description
+
+
+def _semantic_candidate_files(chunks: List[RetrievedChunk]) -> List[str]:
+    """Deduplicated, order-preserving file paths from semantic RAG hits."""
+    seen: List[str] = []
+    for chunk in chunks:
+        if chunk.file_path and chunk.file_path not in seen:
+            seen.append(chunk.file_path)
+    return seen
+
+
+def _merge_candidate_files(
+    semantic_files: List[str], keyword_ranked_files: List[str], limit: int
+) -> List[str]:
+    """Merge semantic-hit file paths AHEAD OF the existing keyword-ranked
+    ones, deduplicated (first occurrence wins) and capped at ``limit``.
+
+    When ``semantic_files`` is empty (semantic retrieval unavailable or
+    contributed nothing), this is byte-identical to the pre-Phase-6B
+    keyword-only ranking sliced the same way -- the core degrade-
+    gracefully guarantee.
+    """
+    merged: List[str] = []
+    for f in list(semantic_files) + list(keyword_ranked_files):
+        if f not in merged:
+            merged.append(f)
+    return merged[:limit]
+
+
+def _projects_for_semantic_retrieval(
+    state: AgentState, limit: int = SEMANTIC_MAX_PROJECTS
+) -> List[ProjectInfo]:
+    """Bounded, real project scoping for semantic retrieval -- reuses the
+    SAME repository evidence baseline_node already computes
+    (_build_repository_evidence), never a fresh/independent scan, capped
+    to the first ``limit`` selected projects so semantic retrieval never
+    issues more than ``limit`` embedding calls per retrieve_node pass
+    regardless of how many projects a monorepo contains or how ambiguous
+    project selection is (select_relevant_projects returns every detected
+    project, unbounded, when nothing disambiguates them)."""
+    evidence = _build_repository_evidence(state)
+    return list(evidence.detected_projects)[:limit]
+
+
+async def _gather_semantic_candidate_files(
+    state: AgentState,
+    repository_id: int,
+    db: Optional[Any],
+    retriever: Optional[CodeRetriever] = None,
+) -> List[str]:
+    """Bounded, best-effort semantic candidate file list for retrieve_node.
+
+    Never raises: any failure (project scoping, RAG/embedding error, an
+    unexpected exception) degrades to an empty list, which makes
+    ``_merge_candidate_files`` fall back to byte-identical keyword-only
+    ranking. ``db`` may legitimately be ``None`` (see
+    app.services.agent.db.open_session) -- CodeRetriever.retrieve_chunks
+    already treats that as "skip semantic retrieval" rather than an error.
+    """
+    retriever = retriever or CodeRetriever()
+    query = _semantic_query_text(state.get("task_description", ""), state.get("error_analysis"))
+
+    try:
+        projects = _projects_for_semantic_retrieval(state)
+    except Exception as e:  # noqa: BLE001 -- project scoping must never block retrieval
+        logger.warning(f"Semantic retrieval project scoping failed unexpectedly: {e}")
+        return []
+
+    chunks: List[RetrievedChunk] = []
+    for project in projects:
+        file_prefix = None if project.root == "." else project.root
+        try:
+            chunks.extend(
+                await retriever.retrieve_chunks(
+                    query=query,
+                    repository_id=repository_id,
+                    top_k=SEMANTIC_TOP_K,
+                    file_prefix=file_prefix,
+                    db=db,
+                )
+            )
+        except RetrievalError as e:
+            logger.warning(f"Semantic retrieval failed for project '{project.root}': {e}")
+            continue
+        except Exception as e:  # noqa: BLE001 -- semantic retrieval is advisory-only, must never crash retrieve_node
+            logger.warning(f"Semantic retrieval failed unexpectedly for project '{project.root}': {e}")
+            continue
+
+    return _semantic_candidate_files(chunks)
+
+
+async def retrieve_node(state: AgentState) -> Dict[str, Any]:
     """Retrieve fresh code context directly from the workspace on disk.
 
-    Candidate files are ranked so those with investigation keyword matches are
-    retrieved first instead of relying on alphabetical order alone.
+    Candidate files are ranked by combining bounded, project-scoped
+    semantic RAG retrieval (Phase 6B) with the existing investigation
+    keyword matches -- semantic hits rank first, deduplicated, capped at
+    RETRIEVAL_LIMIT. retrieved_context's own shape (full-file reads, real
+    on-disk line numbers) is unchanged from before Phase 6B, so
+    plan_node/edit_node/diagnose_node need no changes. When semantic
+    retrieval is unavailable or contributes nothing for any reason (no
+    repository_id in state, no DB session, RAG/embedding failure, empty
+    index), ranking is byte-identical to the pre-Phase-6B keyword-only
+    behavior -- see _merge_candidate_files.
     """
     workspace = state["workspace_dir"]
     file_list = tools.list_files(workspace)
     files = file_list.get("files", [])
 
-    ranked_files = _rank_candidate_files(files, state.get("keyword_matches") or [])[:RETRIEVAL_LIMIT]
+    keyword_ranked = _rank_candidate_files(files, state.get("keyword_matches") or [])
+
+    semantic_files: List[str] = []
+    repository_id = state.get("repository_id")
+    if repository_id is not None:
+        try:
+            async with open_session() as db:
+                semantic_files = await _gather_semantic_candidate_files(state, repository_id, db)
+        except Exception as e:  # noqa: BLE001 -- semantic retrieval must never block retrieval
+            logger.warning(f"Semantic candidate retrieval failed unexpectedly: {e}")
+            semantic_files = []
+
+    # A stale/mismatched chunk-index entry must never introduce a file that
+    # no longer exists (or never existed at this path) into the bounded
+    # candidate list -- restrict semantic hits to files actually present in
+    # the current workspace, exactly like the existing keyword ranking
+    # already implicitly does by only ever reordering `files`.
+    files_set = set(files)
+    semantic_files = [f for f in semantic_files if f in files_set]
+
+    ranked_files = _merge_candidate_files(semantic_files, keyword_ranked, RETRIEVAL_LIMIT)
 
     retrieved: List[Dict[str, Any]] = []
     for f in ranked_files:
