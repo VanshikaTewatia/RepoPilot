@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useCallback, useEffect, useState } from "react";
+import { Check, ExternalLink, X } from "lucide-react";
 import {
   ApiError,
   Task,
@@ -23,13 +24,13 @@ interface ReviewPanelProps {
 /** Classify a raw unified-diff line for coloring. Content is never modified. */
 function lineClass(line: string): string {
   if (line.startsWith("diff --git") || line.startsWith("index ")) {
-    return "text-slate-500";
+    return "text-zinc-500";
   }
   if (line.startsWith("--- ") || line.startsWith("+++ ")) {
-    return "text-slate-400";
+    return "text-zinc-400";
   }
   if (line.startsWith("@@")) {
-    return "text-cyan-400 bg-cyan-950/30";
+    return "text-indigo-400 bg-indigo-950/30";
   }
   if (line.startsWith("+")) {
     return "text-emerald-300 bg-emerald-950/40";
@@ -37,7 +38,7 @@ function lineClass(line: string): string {
   if (line.startsWith("-")) {
     return "text-red-300 bg-red-950/40";
   }
-  return "text-slate-300";
+  return "text-zinc-300";
 }
 
 export default function ReviewPanel({ task, onReviewed }: ReviewPanelProps) {
@@ -169,7 +170,7 @@ export default function ReviewPanel({ task, onReviewed }: ReviewPanelProps) {
   const resolvedPrUrl = prUrl ?? currentTask.pr_url ?? null;
 
   return (
-    <div className="space-y-4 border border-amber-900/60 rounded-xl p-5 bg-amber-950/10">
+    <div className="space-y-4 border border-amber-900/50 rounded-2xl p-5 bg-amber-500/[0.04] shadow-sm shadow-black/20">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <h3 className="font-semibold text-amber-200">
           Review Generated Changes
@@ -177,7 +178,7 @@ export default function ReviewPanel({ task, onReviewed }: ReviewPanelProps) {
         <StatusBadge status={currentTask.status} size="sm" />
       </div>
 
-      <p className="text-sm text-slate-300">
+      <p className="text-sm text-zinc-300">
         The agent verified this fix against the full test suite in an isolated
         workspace. Your original repository has not been modified yet — approve
         to apply the patch (pushing a branch and opening a Pull Request for
@@ -185,23 +186,23 @@ export default function ReviewPanel({ task, onReviewed }: ReviewPanelProps) {
       </p>
 
       {currentTask.status === "approval_failed" && (
-        <div className="border border-orange-800 bg-orange-950/30 rounded-lg p-4 space-y-1">
+        <div className="border border-orange-800 bg-orange-950/30 rounded-xl p-4 space-y-1">
           <p className="text-sm font-semibold text-orange-300">
             The verified fix could not be pushed / opened as a Pull Request.
           </p>
-          <p className="text-xs text-slate-400">
+          <p className="text-xs text-zinc-400">
             The patch itself was verified and is unchanged — the isolated
             workspace and stored diff are preserved. Your repository was
             rolled back to its original branch with nothing partially
             applied. Fix the underlying issue (e.g. configure{" "}
-            <code className="text-slate-300">GITHUB_TOKEN</code> on the
+            <code className="text-zinc-300">GITHUB_TOKEN</code> on the
             server) and press Approve again to retry.
           </p>
         </div>
       )}
 
       {resolvedPrUrl && (
-        <div className="border border-emerald-800 bg-emerald-950/30 rounded-lg p-4 flex items-center justify-between gap-3 flex-wrap">
+        <div className="border border-emerald-800 bg-emerald-950/30 rounded-xl p-4 flex items-center justify-between gap-3 flex-wrap">
           <p className="text-sm text-emerald-300">
             Pull Request created successfully.
           </p>
@@ -209,15 +210,16 @@ export default function ReviewPanel({ task, onReviewed }: ReviewPanelProps) {
             href={resolvedPrUrl}
             target="_blank"
             rel="noopener noreferrer"
-            className="text-sm font-semibold text-emerald-200 underline hover:text-emerald-100 whitespace-nowrap"
+            className="inline-flex items-center gap-1.5 text-sm font-semibold text-emerald-200 underline hover:text-emerald-100 whitespace-nowrap"
           >
-            View Pull Request ↗
+            View Pull Request
+            <ExternalLink className="w-3.5 h-3.5" />
           </a>
         </div>
       )}
 
       {isLoadingTask && (
-        <p className="text-xs text-slate-500 animate-pulse">
+        <p className="text-xs text-zinc-500 animate-pulse">
           Refreshing task details...
         </p>
       )}
@@ -230,7 +232,7 @@ export default function ReviewPanel({ task, onReviewed }: ReviewPanelProps) {
 
       {/* Conflict banner (HTTP 409 from approve) */}
       {conflictMessage && (
-        <div className="border border-red-800 bg-red-950/40 rounded-lg p-4 space-y-1">
+        <div className="border border-red-800 bg-red-950/40 rounded-xl p-4 space-y-1">
           <p className="text-sm font-semibold text-red-300">
             Patch conflict — the repository changed since this fix was
             generated. Nothing was applied.
@@ -238,7 +240,7 @@ export default function ReviewPanel({ task, onReviewed }: ReviewPanelProps) {
           <p className="text-xs font-mono text-red-200/80 break-all">
             {conflictMessage}
           </p>
-          <p className="text-xs text-slate-400 pt-1">
+          <p className="text-xs text-zinc-400 pt-1">
             Resolve the conflict in the repository, then retry approval below.
           </p>
         </div>
@@ -252,7 +254,7 @@ export default function ReviewPanel({ task, onReviewed }: ReviewPanelProps) {
 
       {/* Changed files */}
       {isLoadingDiff ? (
-        <p className="text-sm text-slate-400 animate-pulse">Loading diff...</p>
+        <p className="text-sm text-zinc-400 animate-pulse">Loading diff...</p>
       ) : diffError ? (
         <div className="text-sm text-red-300 bg-red-950/40 border border-red-900 rounded-lg p-3 flex items-center justify-between gap-3">
           <span>{diffError}</span>
@@ -267,14 +269,14 @@ export default function ReviewPanel({ task, onReviewed }: ReviewPanelProps) {
         <>
           {diffData && diffData.changed_files.length > 0 && (
             <div className="space-y-2">
-              <span className="text-xs font-semibold text-slate-400 uppercase tracking-wide">
+              <span className="text-xs font-semibold text-zinc-400 uppercase tracking-wide">
                 Changed Files ({diffData.changed_files.length})
               </span>
               <div className="flex flex-wrap gap-2">
                 {diffData.changed_files.map((file) => (
                   <span
                     key={file}
-                    className="inline-block bg-slate-950 border border-slate-700 text-cyan-300 text-xs font-mono px-2.5 py-1 rounded"
+                    className="inline-block bg-zinc-950 border border-zinc-700 text-indigo-300 text-xs font-mono px-2.5 py-1 rounded"
                   >
                     {file}
                   </span>
@@ -285,15 +287,15 @@ export default function ReviewPanel({ task, onReviewed }: ReviewPanelProps) {
 
           {/* Unified diff */}
           <div className="space-y-2">
-            <span className="text-xs font-semibold text-slate-400 uppercase tracking-wide">
+            <span className="text-xs font-semibold text-zinc-400 uppercase tracking-wide">
               Unified Diff
             </span>
             {diffLines.length === 0 ? (
-              <p className="text-sm text-slate-500 bg-slate-950 border border-slate-800 rounded-lg p-4">
+              <p className="text-sm text-zinc-500 bg-zinc-950 border border-zinc-800 rounded-xl p-4">
                 No textual changes were produced for this task.
               </p>
             ) : (
-              <pre className="bg-slate-950 border border-slate-800 rounded-lg p-0 overflow-x-auto max-h-96 text-xs font-mono leading-5">
+              <pre className="bg-zinc-950 border border-zinc-800 rounded-xl p-0 overflow-x-auto max-h-96 text-xs font-mono leading-5">
                 {diffLines.map((line, i) => (
                   <div
                     key={i}
@@ -308,11 +310,11 @@ export default function ReviewPanel({ task, onReviewed }: ReviewPanelProps) {
 
           {/* Sandbox test output (collapsible) */}
           {currentTask.test_output && (
-            <details className="bg-slate-950 border border-slate-800 rounded-lg overflow-hidden">
-              <summary className="cursor-pointer select-none px-4 py-3 text-xs font-semibold text-slate-400 uppercase tracking-wide hover:text-slate-200">
+            <details className="bg-zinc-950 border border-zinc-800 rounded-xl overflow-hidden">
+              <summary className="cursor-pointer select-none px-4 py-3 text-xs font-semibold text-zinc-400 uppercase tracking-wide hover:text-zinc-200">
                 Sandbox Test Output
               </summary>
-              <pre className="px-4 pb-4 text-xs text-slate-300 overflow-x-auto max-h-64 font-mono whitespace-pre-wrap">
+              <pre className="px-4 pb-4 text-xs text-zinc-300 overflow-x-auto max-h-64 font-mono whitespace-pre-wrap">
                 {currentTask.test_output}
               </pre>
             </details>
@@ -324,20 +326,22 @@ export default function ReviewPanel({ task, onReviewed }: ReviewPanelProps) {
               <button
                 onClick={handleApprove}
                 disabled={acting !== null}
-                className="flex-1 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-semibold px-6 py-2.5 rounded-lg transition"
+                className="flex-1 inline-flex items-center justify-center gap-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-semibold px-6 py-2.5 rounded-lg transition shadow-sm shadow-emerald-950/50"
               >
+                <Check className="w-4 h-4" />
                 {acting === "approve" ? "Applying patch..." : "Approve & Apply"}
               </button>
               <button
                 onClick={handleReject}
                 disabled={acting !== null}
-                className="flex-1 bg-rose-700 hover:bg-rose-600 disabled:opacity-50 text-white font-semibold px-6 py-2.5 rounded-lg transition"
+                className="flex-1 inline-flex items-center justify-center gap-1.5 bg-rose-700 hover:bg-rose-600 disabled:opacity-50 text-white font-semibold px-6 py-2.5 rounded-lg transition"
               >
+                <X className="w-4 h-4" />
                 {acting === "reject" ? "Rejecting..." : "Reject Fix"}
               </button>
             </div>
           ) : (
-            <p className="text-sm text-slate-400 pt-1">
+            <p className="text-sm text-zinc-400 pt-1">
               This task is no longer pending review (status:{" "}
               <span className="font-mono">{currentTask.status}</span>).
             </p>

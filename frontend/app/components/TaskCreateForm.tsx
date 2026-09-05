@@ -49,12 +49,12 @@ export default function TaskCreateForm({
 
   return (
     <div className="space-y-4">
-      <label className="block space-y-1">
-        <span className="text-xs font-semibold text-slate-400 uppercase tracking-wide">
+      <label className="block space-y-1.5">
+        <span className="text-xs font-semibold text-zinc-400 uppercase tracking-wide">
           Issue Description
         </span>
         <textarea
-          className="w-full bg-slate-950 border border-slate-700 rounded-lg px-4 py-3 text-slate-200 text-sm focus:outline-none focus:border-emerald-500 resize-y min-h-[80px]"
+          className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-4 py-3 text-zinc-100 text-sm placeholder:text-zinc-600 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500 resize-y min-h-[80px]"
           value={description}
           onChange={(e) => setDescription(e.target.value)}
           placeholder="Describe the bug or the change the agent should make, e.g. 'Fix the off-by-one error in the pagination helper' or 'Add input validation to the signup form'..."
@@ -65,7 +65,7 @@ export default function TaskCreateForm({
       <div className="flex flex-col sm:flex-row sm:items-center gap-3">
         <button
           onClick={() => setShowAdvanced((v) => !v)}
-          className="text-xs text-slate-400 hover:text-slate-200 underline text-left"
+          className="text-xs text-zinc-400 hover:text-zinc-200 underline text-left"
         >
           {showAdvanced
             ? "Hide advanced options"
@@ -76,44 +76,44 @@ export default function TaskCreateForm({
           onClick={handleSubmit}
           disabled={!canSubmit}
           title={!repo ? "Select a repository first" : undefined}
-          className="sm:ml-auto bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed text-white font-medium px-6 py-2 rounded-lg transition whitespace-nowrap"
+          className="sm:ml-auto bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm font-medium px-6 py-2 rounded-lg transition whitespace-nowrap shadow-sm shadow-indigo-950/50"
         >
           {isSubmitting ? "Agent Working..." : "Start Coding Agent"}
         </button>
       </div>
 
       {showAdvanced && (
-        <div className="bg-slate-950 border border-slate-800 rounded-lg p-4 grid gap-3 sm:grid-cols-3">
-          <label className="block space-y-1">
-            <span className="text-xs font-semibold text-slate-400 uppercase tracking-wide">
+        <div className="bg-zinc-950 border border-zinc-800 rounded-xl p-4 grid gap-3 sm:grid-cols-3">
+          <label className="block space-y-1.5">
+            <span className="text-xs font-semibold text-zinc-400 uppercase tracking-wide">
               Title (optional)
             </span>
             <input
               type="text"
-              className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-emerald-500"
+              className="w-full bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500"
               value={title}
               onChange={(e) => setTitle(e.target.value)}
               placeholder="Defaults to issue description"
             />
           </label>
-          <label className="block space-y-1">
-            <span className="text-xs font-semibold text-slate-400 uppercase tracking-wide">
+          <label className="block space-y-1.5">
+            <span className="text-xs font-semibold text-zinc-400 uppercase tracking-wide">
               Test Target (optional)
             </span>
             <input
               type="text"
-              className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-emerald-500"
+              className="w-full bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500"
               value={testTarget}
               onChange={(e) => setTestTarget(e.target.value)}
               placeholder="tests/test_module.py::test_case"
             />
           </label>
-          <label className="block space-y-1">
-            <span className="text-xs font-semibold text-slate-400 uppercase tracking-wide">
+          <label className="block space-y-1.5">
+            <span className="text-xs font-semibold text-zinc-400 uppercase tracking-wide">
               Max Attempts
             </span>
             <select
-              className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-emerald-500"
+              className="w-full bg-zinc-900 border border-zinc-800 rounded-lg px-3 py-2 text-sm text-zinc-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/40 focus:border-indigo-500"
               value={maxAttempts}
               onChange={(e) => setMaxAttempts(Number(e.target.value))}
             >

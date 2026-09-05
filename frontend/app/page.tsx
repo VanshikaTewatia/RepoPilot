@@ -1,157 +1,143 @@
 "use client";
 
-import React, { useCallback, useState } from "react";
-import {
-  Repository,
-  Task,
-  isApiError,
-  submitTask,
-} from "@/lib/api";
-import RepositoryPicker from "./components/RepositoryPicker";
-import DeepQAPanel from "./components/DeepQAPanel";
-import TaskCreateForm from "./components/TaskCreateForm";
-import TaskProgress from "./components/TaskProgress";
-import ReviewPanel from "./components/ReviewPanel";
+import React, { useCallback, useEffect, useState } from "react";
+import Link from "next/link";
+import { FolderGit2, Plug, X } from "lucide-react";
+import { Repository, isApiError, listRepositories } from "@/lib/api";
+import ConnectRepositoryPanel from "./components/ConnectRepositoryPanel";
 import StatusBadge from "./components/StatusBadge";
-import { isFinalTaskStatus, needsHumanReview } from "@/lib/taskStatus";
 
-export default function Home() {
-  // Repository selection (Section 1)
-  const [selectedRepo, setSelectedRepo] = useState<Repository | null>(null);
+export default function Dashboard() {
+  const [repos, setRepos] = useState<Repository[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [showConnect, setShowConnect] = useState(false);
 
-  // AI Coding Agent (Section 3)
-  const [task, setTask] = useState<Task | null>(null);
-  const [creating, setCreating] = useState(false);
-  const [agentError, setAgentError] = useState<string | null>(null);
-
-  const handleTaskChange = useCallback((updated: Task) => {
-    setTask(updated);
+  const loadRepositories = useCallback(async () => {
+    setIsLoading(true);
+    setError(null);
+    try {
+      setRepos(await listRepositories());
+    } catch (err) {
+      setError(isApiError(err) ? err.detail : "Failed to load repositories.");
+    } finally {
+      setIsLoading(false);
+    }
   }, []);
 
-  const handleCreateTask = useCallback(
-    async (payload: {
-      description: string;
-      title?: string;
-      test_target?: string;
-      max_attempts?: number;
-    }) => {
-      if (!selectedRepo) return;
+  useEffect(() => {
+    void loadRepositories();
+  }, [loadRepositories]);
 
-      setCreating(true);
-      setAgentError(null);
-      try {
-        const created = await submitTask({
-          repository_id: selectedRepo.id,
-          ...payload,
-        });
-        setTask(created);
-      } catch (err) {
-        setAgentError(
-          isApiError(err) ? err.detail : "Failed to create the coding task."
-        );
-      } finally {
-        setCreating(false);
-      }
-    },
-    [selectedRepo]
-  );
-
-  const handleReviewed = useCallback(
-    (status: string) => {
-      setTask((prev) => (prev ? { ...prev, status } : prev));
-    },
-    []
-  );
+  const handleConnected = (repo: Repository) => {
+    setRepos((prev) => [repo, ...prev]);
+    setShowConnect(false);
+  };
 
   return (
-    <main className="max-w-6xl mx-auto p-8 space-y-8">
-      {/* Header */}
-      <header className="border-b border-slate-800 pb-6">
-        <h1 className="text-3xl font-bold tracking-tight text-cyan-400">
-          RepoPilot
-        </h1>
-        <p className="text-slate-400 mt-1">
-          Autonomous AI Software Engineer — isolated workspaces, sandboxed
-          testing, human-approved patches, and automatic Pull Requests for
-          GitHub-connected repositories.
-        </p>
-      </header>
-
-      {/* Section 1: Repository selection / registration / indexing */}
-      <RepositoryPicker selectedRepo={selectedRepo} onSelect={setSelectedRepo} />
-
-      {/* Section 2: Deep Codebase Q&A */}
-      <DeepQAPanel selectedRepo={selectedRepo} />
-
-      {/* Section 3: AI Coding Agent workflow */}
-      <section className="bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-5">
-        <div className="flex items-center justify-between flex-wrap gap-2">
-          <h2 className="text-xl font-semibold text-slate-200">
-            3. AI Coding Agent
-          </h2>
-          {selectedRepo && (
-            <span className="text-xs text-slate-500">
-              Target:{" "}
-              <span className="text-slate-300 font-mono">
-                {selectedRepo.name}
-              </span>
-            </span>
-          )}
-        </div>
-
-        {/* Step A: describe the task */}
-        {!task && !creating && (
-          <TaskCreateForm
-            repo={selectedRepo}
-            onSubmit={handleCreateTask}
-          />
-        )}
-
-        {/* Step B: agent progress (live or post-run) */}
-        {(creating || task) && (
-          <TaskProgress
-            task={task}
-            creating={creating}
-            onTaskChange={handleTaskChange}
-          />
-        )}
-
-        {agentError && (
-          <p className="text-sm text-red-300 bg-red-950/40 border border-red-900 rounded-lg p-3">
-            {agentError}
+    <main className="flex-1 w-full max-w-5xl mx-auto px-6 py-10 space-y-6">
+      <div className="flex flex-wrap items-start justify-between gap-4 pb-2">
+        <div>
+          <h1 className="text-xl font-semibold text-zinc-100">
+            Your development workspace
+          </h1>
+          <p className="text-sm text-zinc-400 mt-1 max-w-2xl">
+            Connect a repository to index it, ask evidence-based questions
+            about the codebase, and let RepoPilot investigate, plan, and
+            verify fixes inside an isolated workspace before you approve them.
           </p>
+        </div>
+        {repos.length > 0 && (
+          <button
+            onClick={() => setShowConnect((v) => !v)}
+            className="inline-flex items-center gap-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium px-4 py-2 rounded-lg transition whitespace-nowrap"
+          >
+            {showConnect ? (
+              <>
+                <X className="w-3.5 h-3.5" />
+                Cancel
+              </>
+            ) : (
+              <>
+                <Plug className="w-3.5 h-3.5" />
+                Connect Repository
+              </>
+            )}
+          </button>
         )}
+      </div>
 
-        {/* Step C: human review of generated changes (also re-shown after a
-            push/PR failure so the verified fix can be retried without
-            re-running the agent) */}
-        {task && needsHumanReview(task.status) && (
-          <ReviewPanel task={task} onReviewed={handleReviewed} />
-        )}
+      {showConnect && <ConnectRepositoryPanel onConnected={handleConnected} />}
 
-        {/* Step D: final outcome */}
-        {task && isFinalTaskStatus(task.status) && (
-          <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 pt-1">
-            <StatusBadge status={task.status} size="lg" />
-            <button
-              onClick={() => {
-                setTask(null);
-                setAgentError(null);
-              }}
-              className="border border-slate-700 hover:border-slate-500 text-slate-300 text-sm font-medium px-5 py-2 rounded-lg transition"
+      {error && (
+        <p className="text-sm text-red-400 bg-red-950/40 border border-red-900 rounded-lg p-3">
+          {error}{" "}
+          <button
+            onClick={() => void loadRepositories()}
+            className="underline hover:text-red-300"
+          >
+            Retry
+          </button>
+        </p>
+      )}
+
+      {isLoading && (
+        <p className="text-sm text-zinc-500">Loading repositories...</p>
+      )}
+
+      {!isLoading && !error && repos.length === 0 && !showConnect && (
+        <div className="border border-dashed border-zinc-800 rounded-2xl p-12 flex flex-col items-center text-center gap-3">
+          <span className="flex items-center justify-center w-11 h-11 rounded-xl bg-indigo-500/10 text-indigo-400">
+            <FolderGit2 className="w-5 h-5" />
+          </span>
+          <h2 className="text-base font-semibold text-zinc-100">
+            Connect your first repository
+          </h2>
+          <p className="text-sm text-zinc-500 max-w-sm">
+            Register a local path or clone from GitHub to start indexing,
+            asking questions, and running the coding agent against it.
+          </p>
+          <button
+            onClick={() => setShowConnect(true)}
+            className="mt-2 inline-flex items-center gap-1.5 bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-medium px-5 py-2 rounded-lg transition"
+          >
+            <Plug className="w-3.5 h-3.5" />
+            Connect Repository
+          </button>
+        </div>
+      )}
+
+      {repos.length > 0 && (
+        <div className="grid gap-4 sm:grid-cols-2">
+          {repos.map((repo) => (
+            <Link
+              key={repo.id}
+              href={`/repositories/${repo.id}`}
+              className="bg-zinc-900/60 border border-zinc-800 hover:border-zinc-700 rounded-2xl p-5 space-y-3 transition shadow-sm shadow-black/20"
             >
-              Start Another Task
-            </button>
-          </div>
-        )}
-      </section>
-
-      <footer className="text-center text-xs text-slate-600 pb-4">
-        RepoPilot runs every task inside an isolated copy of your repository —
-        the original code is only modified (and, for GitHub repositories,
-        only branched, pushed, and opened as a Pull Request) once you approve
-        a fix.
-      </footer>
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <span className="flex items-center justify-center w-8 h-8 rounded-lg bg-indigo-500/10 text-indigo-400 shrink-0">
+                    <FolderGit2 className="w-4 h-4" />
+                  </span>
+                  <div className="min-w-0">
+                    <h3 className="text-sm font-semibold text-zinc-100 truncate">
+                      {repo.name}
+                    </h3>
+                    <p className="text-xs text-zinc-500 truncate">
+                      {repo.remote_url ?? repo.local_path}
+                    </p>
+                  </div>
+                </div>
+                <StatusBadge status={repo.status} size="sm" />
+              </div>
+              <p className="text-[11px] font-mono text-zinc-600">
+                #{repo.id} · {repo.default_branch}
+              </p>
+            </Link>
+          ))}
+        </div>
+      )}
     </main>
   );
 }
