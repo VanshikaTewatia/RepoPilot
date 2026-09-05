@@ -19,6 +19,23 @@ import pytest
 from app.services.agent.graph import agent_app, edit_node, finalize_node
 
 
+def _not_applicable_baseline_response() -> MagicMock:
+    """The full graph now runs a real (mocked, per-test) baseline
+    reproduction planning call between investigate and retrieve -- see
+    app.services.agent.graph.baseline_node. A genuine NOT_APPLICABLE
+    response keeps it a no-op for outcome tests that aren't specifically
+    exercising baseline gating (see test_baseline_gating_*.py-style tests
+    below that DO)."""
+    response = MagicMock()
+    response.text = json.dumps({
+        "applicable": False,
+        "reason": "No repository evidence supports a specific reproduction for this task.",
+        "reproduction_type": "not_applicable",
+        "commands": [],
+    })
+    return response
+
+
 def _base_state(workspace: Path, task_description: str, **overrides) -> dict:
     state = {
         "task_id": 1,
@@ -193,7 +210,7 @@ async def test_outcome_fixed_when_bug_confirmed_and_patch_verified():
             }
         ])
         mock_client = MagicMock()
-        mock_client.models.generate_content.return_value = mock_response
+        mock_client.models.generate_content.side_effect = [_not_applicable_baseline_response(), mock_response]
 
         initial_state = _base_state(workspace, "The add() function in math_lib.py returns the wrong result.")
 

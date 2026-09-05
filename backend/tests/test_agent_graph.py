@@ -18,6 +18,24 @@ from app.services.agent.graph import (
 )
 
 
+def _not_applicable_baseline_response() -> MagicMock:
+    """The full graph now runs a real (mocked, per-test) baseline
+    reproduction planning call between investigate and retrieve -- see
+    app.services.agent.graph.baseline_node. Tests below that patch
+    genai.Client with a scripted call queue for patch generation must
+    account for this extra, earlier call; a genuine NOT_APPLICABLE response
+    keeps it a no-op for tests that aren't exercising baseline behavior
+    itself (see test_agent_outcomes.py for tests that do)."""
+    response = MagicMock()
+    response.text = json.dumps({
+        "applicable": False,
+        "reason": "No repository evidence supports a specific reproduction for this task.",
+        "reproduction_type": "not_applicable",
+        "commands": [],
+    })
+    return response
+
+
 def test_validate_patch_and_malformed_rejection():
     """Test patch validation logic rejects malformed inputs safely."""
     # Valid whole-file replacement
@@ -205,7 +223,11 @@ async def test_agent_graph_retry_path_analyze_failure_to_plan():
         ])
 
         mock_client = MagicMock()
-        mock_client.models.generate_content.side_effect = [response_attempt_1, response_attempt_2]
+        mock_client.models.generate_content.side_effect = [
+            _not_applicable_baseline_response(),
+            response_attempt_1,
+            response_attempt_2,
+        ]
 
         initial_state = {
             "task_id": 10,
@@ -288,7 +310,7 @@ async def test_retry_causes_fresh_retrieval_and_context():
         resp2.text = json.dumps([{"file_path": "counter.py", "code": "count = 5\n", "start_line": 1, "end_line": 1}])
 
         mock_client = MagicMock()
-        mock_client.models.generate_content.side_effect = [resp1, resp2]
+        mock_client.models.generate_content.side_effect = [_not_applicable_baseline_response(), resp1, resp2]
 
         initial_state = {
             "task_id": 20,

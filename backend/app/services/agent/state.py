@@ -36,3 +36,21 @@ class AgentState(TypedDict, total=False):
     # See app.services.agent.graph.finalize_node.
     outcome: Optional[str]
     outcome_detail: Optional[str]
+    # Phase 4B-3: evidence-driven baseline reproduction, run once between
+    # investigate and retrieve -- see app.services.agent.graph.baseline_node.
+    # Baseline reproduction is evidence gathering, never proof of
+    # correctness: "REPRODUCED" | "NOT_REPRODUCED" | "UNABLE_TO_REPRODUCE" |
+    # "NOT_APPLICABLE". A planner/bridge failure (planning_failed=True, or a
+    # bridge PLANNING_FAILED outcome) is always surfaced here as
+    # "UNABLE_TO_REPRODUCE", never "NOT_APPLICABLE" -- see
+    # app.services.baseline's own planning_failed/BridgeOutcome semantics.
+    # finalize_node is the only place this is allowed to affect the task's
+    # final outcome, and only to prevent a false FIXED claim.
+    baseline_status: Optional[str]
+    # The full app.services.baseline.BaselineResult.to_dict() when Phase 4A
+    # actually executed a reproduction (None for NOT_APPLICABLE/
+    # UNABLE_TO_REPRODUCE cases that never reached execution).
+    baseline_result: Optional[Dict[str, Any]]
+    # Human-readable explanation of baseline_status, always set regardless
+    # of whether execution happened.
+    baseline_detail: Optional[str]

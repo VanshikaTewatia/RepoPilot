@@ -11,6 +11,16 @@ from app.core.config import settings
 from app.core.logging import logger
 from app.services.agent.state import AgentState
 from app.services.agent import tools
+from app.services.baseline import (
+    BridgeOutcome,
+    EvidenceReference,
+    KnownCommand,
+    RepositoryEvidence,
+    build_reproduction_input,
+    plan_reproduction,
+    reproduce,
+)
+from app.services.verification.project_analyzer import ProjectInfo, RepositoryAnalyzer, select_relevant_projects
 
 
 def validate_patch(patch: Any, workspace_dir: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -274,6 +284,165 @@ def investigate_node(state: AgentState) -> Dict[str, Any]:
     return res_dict
 
 
+# ---------------------------------------------------------------------------
+# Phase 4B-3: evidence-driven baseline reproduction.
+#
+# Runs once, between investigate and retrieve -- before any diagnosis/fix is
+# attempted, and before the retry loop (analyze_failure -> retrieve) that
+# never re-enters this node. Reuses the existing Phase 4B-1 planner, Phase
+# 4B-2 bridge, and Phase 4A executor/classifier exactly as they already
+# exist: no second executor, no direct Docker access, no independent
+# repository scan -- RepositoryAnalyzer (the same deterministic analysis
+# VerificationEngine.verify_repository already uses) is the sole source of
+# detected-project evidence.
+# ---------------------------------------------------------------------------
+
+# Node's own test/build command is deliberately absent from
+# project_analyzer's ECOSYSTEM_METADATA (it's read from each project's own
+# package.json, not a fixed convention) -- derived here directly from that
+# same manifest file, never invented, and bounded to the two script names a
+# reproduction could plausibly need.
+_NODE_KNOWN_SCRIPT_NAMES = ("test", "build")
+
+
+def _known_commands_for_project(workspace: str, project: ProjectInfo) -> List[KnownCommand]:
+    """Real, evidence-backed commands for one detected project -- never a
+    guess. ``source_file`` is always a manifest RepositoryAnalyzer/
+    ProjectDetector already used as evidence for this project's ecosystem,
+    so plan_validator's evidence_refs check can verify against it."""
+    commands: List[KnownCommand] = []
+    source_file = project.evidence[0] if project.evidence else None
+
+    if project.test_system and source_file:
+        parts = project.test_system.split()
+        if parts:
+            commands.append(
+                KnownCommand(
+                    command=parts,
+                    description=f"{project.ecosystem} project's conventional test command",
+                    source_file=source_file,
+                )
+            )
+
+    if project.ecosystem == "node":
+        manifest_rel = "package.json" if project.root == "." else f"{project.root}/package.json"
+        content_res = tools.read_file(workspace, manifest_rel)
+        if content_res.get("success"):
+            try:
+                scripts = json.loads(content_res.get("content", "{}")).get("scripts") or {}
+            except Exception:
+                scripts = {}
+            for name in _NODE_KNOWN_SCRIPT_NAMES:
+                if isinstance(scripts.get(name), str):
+                    commands.append(
+                        KnownCommand(
+                            command=["npm", "run", name],
+                            description=f"package.json '{name}' script: {scripts[name]}",
+                            source_file=manifest_rel,
+                        )
+                    )
+
+    return commands
+
+
+def _evidence_references_from_matches(
+    keyword_matches: List[Dict[str, Any]], limit: int = 10
+) -> List[EvidenceReference]:
+    """Bounded EvidenceReferences from investigate_node's own search
+    results -- the same keyword_matches already used to rank retrieval and
+    select relevant projects, never a fresh search."""
+    refs: List[EvidenceReference] = []
+    for match in keyword_matches[:limit]:
+        if not isinstance(match, dict):
+            continue
+        file_path = match.get("file")
+        if not file_path:
+            continue
+        line = match.get("line")
+        description = (match.get("content") or "").strip()[:200]
+        refs.append(EvidenceReference(file_path=file_path, description=description, line_start=line, line_end=line))
+    return refs
+
+
+def _build_repository_evidence(state: AgentState) -> RepositoryEvidence:
+    """Assemble RepositoryEvidence from the SAME deterministic repository
+    analysis and investigation data the rest of the agent already produced
+    -- never a fresh independent scan, and never derived from the user's
+    own wording (task_description is used by select_relevant_projects only
+    to narrow *which already-detected* project(s) are relevant, exactly as
+    VerificationEngine.verify_repository already does -- it is never used to
+    decide what ecosystems/projects exist)."""
+    workspace = state["workspace_dir"]
+    task_description = state.get("task_description", "")
+    keyword_matches = state.get("keyword_matches") or []
+
+    projects = RepositoryAnalyzer.analyze(Path(workspace))
+    selected = (
+        projects
+        if len(projects) <= 1
+        else select_relevant_projects(projects, task_description=task_description, keyword_matches=keyword_matches)
+    )
+
+    known_commands: List[KnownCommand] = []
+    for project in selected:
+        known_commands.extend(_known_commands_for_project(workspace, project))
+
+    return RepositoryEvidence(
+        detected_projects=selected,
+        known_commands=known_commands,
+        investigation_findings=state.get("investigation_findings", ""),
+        evidence_references=_evidence_references_from_matches(keyword_matches),
+    )
+
+
+async def baseline_node(state: AgentState) -> Dict[str, Any]:
+    """Establish, before any fix is attempted, whether the reported bug can
+    be independently demonstrated against the isolated task workspace.
+
+    This is evidence gathering ONLY -- it never itself declares the task
+    fixed/unfixed. ``finalize_node`` is the sole place ``baseline_status``
+    is allowed to affect the task's final outcome, and only to prevent a
+    false FIXED claim; a planner/bridge failure is always surfaced as
+    UNABLE_TO_REPRODUCE here, never silently reinterpreted as NOT_APPLICABLE
+    (which is reserved for a genuine "no evidence-backed reproduction
+    exists" verdict) or as any positive/negative claim about the bug.
+    """
+    workspace = state["workspace_dir"]
+    task_description = state.get("task_description", "")
+
+    try:
+        evidence = _build_repository_evidence(state)
+        plan = await plan_reproduction(task_description, evidence)
+
+        if plan.planning_failed:
+            status, result, detail = "UNABLE_TO_REPRODUCE", None, (plan.failure_reason or plan.reason)
+        elif not plan.applicable:
+            status, result, detail = "NOT_APPLICABLE", None, plan.reason
+        else:
+            bridge_result = build_reproduction_input(plan, evidence, workspace_path=workspace)
+            if bridge_result.outcome == BridgeOutcome.PLANNING_FAILED:
+                status, result, detail = "UNABLE_TO_REPRODUCE", None, bridge_result.detail
+            elif bridge_result.outcome == BridgeOutcome.NOT_APPLICABLE:
+                status, result, detail = "NOT_APPLICABLE", None, bridge_result.detail
+            else:
+                baseline_result = reproduce(bridge_result.reproduction_input)
+                status = baseline_result.status.value
+                result = baseline_result.to_dict()
+                detail = baseline_result.detail
+    except Exception as e:  # noqa: BLE001 -- a baseline-integration failure must never crash the task, and must never be silently treated as a verdict about the bug
+        logger.warning(f"Baseline reproduction integration failed unexpectedly: {e}")
+        status, result, detail = "UNABLE_TO_REPRODUCE", None, f"Baseline reproduction failed unexpectedly: {e}"
+
+    message = f"Baseline reproduction: {status} -- {detail}"
+    return {
+        "status": "baseline_checked",
+        "baseline_status": status,
+        "baseline_result": result,
+        "baseline_detail": detail,
+        "messages": state.get("messages", []) + [{"role": "agent", "content": message}],
+    }
+
+
 RETRIEVAL_LIMIT = 5
 
 
@@ -464,12 +633,30 @@ def finalize_node(state: AgentState) -> Dict[str, Any]:
     explicit ``0`` downgrades an otherwise-FIXED result, so a caller that
     never ran a real edit pass (e.g. a unit test constructing state by
     hand) sees the same behavior as before this field existed.
+
+    ``baseline_status`` (Phase 4B-3, set by ``baseline_node``) gates ONLY
+    the one branch below that would otherwise claim FIXED -- a passing test
+    suite plus an applied patch is not, by itself, evidence that the
+    *reported* bug ever existed or is now gone; baseline reproduction is
+    evidence gathering, never proof of correctness. Both "UNABLE_TO_REPRODUCE"
+    and "NOT_REPRODUCED" downgrade this branch to UNABLE_TO_VERIFY -- never
+    NO_CHANGE_NEEDED, which specifically (and here, falsely) means "no code
+    change was actually made". The two remain distinguishable via
+    ``baseline_status``/``baseline_detail`` even though they share this one
+    conservative outcome category; see the NOT_REPRODUCED branch below for
+    why NO_CHANGE_NEEDED would misrepresent it. Every other branch
+    (NO_CHANGE_NEEDED, FAILED, tooling UNABLE_TO_VERIFY) already means "no
+    fix is being claimed" and is left untouched regardless of
+    ``baseline_status`` -- including when it is absent entirely (``None``,
+    e.g. a hand-constructed state, or any task predating this integration),
+    which behaves identically to before this field existed.
     """
     test_res = state.get("test_results") or {}
     patches = state.get("proposed_patches") or []
     is_verified = state.get("is_verified", False)
     applied_count = state.get("applied_patch_count")
     zero_applied = bool(patches) and applied_count == 0
+    baseline_status = state.get("baseline_status")
 
     if not test_res.get("available", True):
         outcome = "UNABLE_TO_VERIFY"
@@ -486,6 +673,43 @@ def finalize_node(state: AgentState) -> Dict[str, Any]:
         detail = (
             "Verification passed without any code changes; the reported behavior "
             "was already correct or the claimed issue could not be substantiated."
+        )
+    elif is_verified and baseline_status == "UNABLE_TO_REPRODUCE":
+        # A patch applied and full verification passed, but baseline
+        # reproduction never established that the reported issue actually
+        # existed -- claiming FIXED here would be an unsupported guess.
+        outcome = "UNABLE_TO_VERIFY"
+        detail = (
+            "The patch applied and verification passed, but baseline reproduction "
+            "could not establish whether the reported issue actually existed "
+            f"({state.get('baseline_detail') or 'inconclusive'}). This is not "
+            "evidence the fix is correct or incorrect."
+        )
+    elif is_verified and baseline_status == "NOT_REPRODUCED":
+        # NOT_REPRODUCED means the reproduction procedure executed
+        # successfully and did not observe the reported behavior -- it does
+        # NOT mean "verified as already correct". NO_CHANGE_NEEDED's actual
+        # meaning elsewhere in this function is "no code change was
+        # actually made" (zero patches, or none applied); that is false
+        # here -- a patch WAS generated and applied, so labeling this
+        # NO_CHANGE_NEEDED would misrepresent that a real change occurred.
+        # A reproduction procedure can also fail to observe a real issue
+        # because the procedure itself was incomplete or state-dependent,
+        # not because the bug is absent -- so this must not be read as
+        # confirmation the code was already correct either. UNABLE_TO_VERIFY
+        # is the most conservative existing outcome that doesn't claim
+        # either: it already means "no confident determination could be
+        # made", which is exactly this situation. baseline_status in state
+        # (and the detail text below) keeps NOT_REPRODUCED distinguishable
+        # from UNABLE_TO_REPRODUCE even though both map to this outcome.
+        outcome = "UNABLE_TO_VERIFY"
+        detail = (
+            "The patch applied and verification passed, but baseline reproduction "
+            "did not observe the reported issue before the fix "
+            f"({state.get('baseline_detail') or 'no evidence of the reported behavior'}). "
+            "This does not confirm the reported issue was already absent -- the "
+            "reproduction procedure may not have captured it -- so this is not "
+            "reported as a confirmed fix."
         )
     elif is_verified:
         outcome = "FIXED"
@@ -513,6 +737,7 @@ def build_agent_graph():
     builder = StateGraph(AgentState)
 
     builder.add_node("investigate", investigate_node)
+    builder.add_node("baseline", baseline_node)
     builder.add_node("retrieve", retrieve_node)
     builder.add_node("plan", plan_node)
     builder.add_node("edit", edit_node)
@@ -522,7 +747,8 @@ def build_agent_graph():
     builder.add_node("finalize", finalize_node)
 
     builder.add_edge(START, "investigate")
-    builder.add_edge("investigate", "retrieve")
+    builder.add_edge("investigate", "baseline")
+    builder.add_edge("baseline", "retrieve")
     builder.add_edge("retrieve", "plan")
     builder.add_edge("plan", "edit")
     builder.add_edge("edit", "test")
