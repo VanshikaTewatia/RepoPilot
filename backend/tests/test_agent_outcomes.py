@@ -36,6 +36,17 @@ def _not_applicable_baseline_response() -> MagicMock:
     return response
 
 
+def _no_evidence_diagnosis_response() -> MagicMock:
+    """The full graph now also runs a real (mocked, per-test) diagnosis
+    Gemini call on every pass between retrieve and plan -- see
+    app.services.agent.graph.diagnose_node. A genuine no-evidence-shaped
+    response keeps it advisory-inert for outcome tests that aren't
+    specifically exercising diagnosis behavior itself."""
+    response = MagicMock()
+    response.text = json.dumps({"summary": "", "hypotheses": [], "confidence": "no_evidence"})
+    return response
+
+
 def _base_state(workspace: Path, task_description: str, **overrides) -> dict:
     state = {
         "task_id": 1,
@@ -210,7 +221,11 @@ async def test_outcome_fixed_when_bug_confirmed_and_patch_verified():
             }
         ])
         mock_client = MagicMock()
-        mock_client.models.generate_content.side_effect = [_not_applicable_baseline_response(), mock_response]
+        mock_client.models.generate_content.side_effect = [
+            _not_applicable_baseline_response(),
+            _no_evidence_diagnosis_response(),
+            mock_response,
+        ]
 
         initial_state = _base_state(workspace, "The add() function in math_lib.py returns the wrong result.")
 

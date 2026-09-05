@@ -24,6 +24,7 @@ from app.services.baseline import (
     reproduce,
 )
 from app.services.verification.project_analyzer import ProjectInfo, RepositoryAnalyzer, select_relevant_projects
+from app.services.diagnosis import diagnose, DiagnosisStatus
 
 
 def validate_patch(patch: Any, workspace_dir: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -162,11 +163,43 @@ def _fence_language_for_path(file_path: str) -> str:
     return _FENCE_LANGUAGE_BY_EXTENSION.get(Path(file_path).suffix.lower(), "text")
 
 
+def _format_diagnosis_for_prompt(diagnosis: Dict[str, Any]) -> str:
+    """Render a validated, DIAGNOSED ``Diagnosis.to_dict()`` as an advisory
+    prompt section for ``_generate_patches_with_gemini``.
+
+    Returns "" when there is nothing substantive to add (e.g. an empty
+    summary and no hypotheses) so the caller never appends a hollow
+    section -- see ``_generate_patches_with_gemini``'s byte-for-byte
+    no-diagnosis guarantee.
+    """
+    summary = diagnosis.get("summary") or ""
+    hypotheses = diagnosis.get("hypotheses") or []
+    if not summary and not hypotheses:
+        return ""
+
+    lines = ["Root Cause Diagnosis (advisory -- verify against the context above before relying on it):"]
+    if summary:
+        lines.append(summary)
+    for h in hypotheses:
+        citations = h.get("citations") or []
+        citation_str = ", ".join(
+            f"{c.get('file_path')}:{c.get('start_line')}-{c.get('end_line')}" for c in citations
+        )
+        line = f"- Hypothesis {h.get('rank')}: {h.get('description', '')}"
+        if citation_str:
+            line += f" (evidence: {citation_str})"
+        if h.get("suggested_fix_approach"):
+            line += f" Suggested approach: {h['suggested_fix_approach']}"
+        lines.append(line)
+    return "\n".join(lines) + "\n\n"
+
+
 def _generate_patches_with_gemini(
     task_description: str,
     retrieved_context: List[Dict[str, Any]],
     error_analysis: Optional[str] = None,
     workspace_dir: Optional[str] = None,
+    diagnosis: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Generate structured code patches using Gemini LLM."""
     if not settings.gemini_api_key or settings.gemini_api_key.startswith("test") or settings.gemini_api_key.startswith("mock"):
@@ -214,6 +247,9 @@ def _generate_patches_with_gemini(
     )
     if error_analysis:
         prompt += f"Previous Attempt Test Failure Trace:\n{error_analysis}\n\nFix the failure in your new patch proposal.\n\n"
+
+    if diagnosis and diagnosis.get("status") == DiagnosisStatus.DIAGNOSED.value:
+        prompt += _format_diagnosis_for_prompt(diagnosis)
 
     prompt += "Generate the JSON patch array now:"
 
@@ -527,11 +563,52 @@ def retrieve_node(state: AgentState) -> Dict[str, Any]:
     }
 
 
+async def diagnose_node(state: AgentState) -> Dict[str, Any]:
+    """Evidence-driven root-cause diagnosis (Phase 6A) -- advisory only.
+
+    Runs once between retrieve_node and plan_node, and again on every retry
+    (analyze_failure -> retrieve -> diagnose -> plan), always working from
+    the freshly retrieved_context and the current error_analysis so a
+    diagnosis never goes stale across attempts. This is evidence gathering
+    ONLY -- it never itself proposes a patch, and a DIAGNOSIS_FAILED or
+    INSUFFICIENT_EVIDENCE result must never block or alter plan_node's
+    existing patch-generation behavior; see app.services.diagnosis's
+    package docstring. Never calls reproduction, Docker, workspace
+    creation, or remote code-hosting functionality, and never raises -- a
+    failure here must never crash the task.
+    """
+    task_description = state.get("task_description", "")
+    retrieved_context = state.get("retrieved_context") or []
+    error_analysis = state.get("error_analysis")
+
+    try:
+        result = await diagnose(
+            task_description=task_description,
+            retrieved_context=retrieved_context,
+            error_analysis=error_analysis,
+        )
+    except Exception as e:  # noqa: BLE001 -- diagnosis is advisory-only and must never crash the task
+        logger.warning(f"Diagnosis failed unexpectedly: {e}")
+        return {
+            "diagnosis_status": DiagnosisStatus.DIAGNOSIS_FAILED.value,
+            "diagnosis": None,
+            "diagnosis_detail": f"Diagnosis failed unexpectedly: {e}",
+        }
+
+    detail = result.summary or result.failure_reason or result.status.value
+    return {
+        "diagnosis_status": result.status.value,
+        "diagnosis": result.to_dict(),
+        "diagnosis_detail": detail,
+    }
+
+
 def plan_node(state: AgentState) -> Dict[str, Any]:
     """Generate repair plan and structured proposed patches based on fresh context."""
     desc = state["task_description"]
     workspace = state.get("workspace_dir", "")
     error_analysis = state.get("error_analysis")
+    diagnosis = state.get("diagnosis")
 
     # Always ensure retrieved_context contains the latest file content from disk
     fresh_retrieved: List[Dict[str, Any]] = []
@@ -554,6 +631,7 @@ def plan_node(state: AgentState) -> Dict[str, Any]:
             retrieved_context=fresh_retrieved,
             error_analysis=error_analysis,
             workspace_dir=workspace,
+            diagnosis=diagnosis,
         )
     else:
         existing_patches = state.get("proposed_patches")
@@ -565,6 +643,7 @@ def plan_node(state: AgentState) -> Dict[str, Any]:
                 retrieved_context=fresh_retrieved,
                 error_analysis=None,
                 workspace_dir=workspace,
+                diagnosis=diagnosis,
             )
 
     files_str = ", ".join(c["file_path"] for c in fresh_retrieved)
@@ -890,6 +969,7 @@ def build_agent_graph():
     builder.add_node("investigate", investigate_node)
     builder.add_node("baseline", baseline_node)
     builder.add_node("retrieve", retrieve_node)
+    builder.add_node("diagnose", diagnose_node)
     builder.add_node("plan", plan_node)
     builder.add_node("edit", edit_node)
     builder.add_node("test", test_node)
@@ -901,7 +981,8 @@ def build_agent_graph():
     builder.add_edge(START, "investigate")
     builder.add_edge("investigate", "baseline")
     builder.add_edge("baseline", "retrieve")
-    builder.add_edge("retrieve", "plan")
+    builder.add_edge("retrieve", "diagnose")
+    builder.add_edge("diagnose", "plan")
     builder.add_edge("plan", "edit")
     builder.add_edge("edit", "test")
     builder.add_edge("test", "verify")

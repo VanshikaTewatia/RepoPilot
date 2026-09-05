@@ -330,8 +330,20 @@ async def test_full_graph_retry_never_reruns_baseline_or_creates_a_second_worksp
         fix_response.text = json.dumps([
             {"file_path": "math_lib.py", "code": "def add(a, b):\n    return a + b\n", "start_line": 1, "end_line": 2}
         ])
+        # diagnose_node also runs a real (mocked) Gemini call on every pass
+        # between retrieve and plan -- see app.services.agent.graph.
+        # diagnose_node. A genuine no-evidence-shaped response before each
+        # patch-generation response keeps it advisory-inert here, since
+        # this test isn't exercising diagnosis behavior itself.
+        no_evidence_diagnosis_response = MagicMock()
+        no_evidence_diagnosis_response.text = json.dumps({"summary": "", "hypotheses": [], "confidence": "no_evidence"})
         mock_client = MagicMock()
-        mock_client.models.generate_content.side_effect = [empty_response, fix_response]
+        mock_client.models.generate_content.side_effect = [
+            no_evidence_diagnosis_response,
+            empty_response,
+            no_evidence_diagnosis_response,
+            fix_response,
+        ]
 
         plan = _applicable_plan()
         bridge_result = _executable_bridge_result(str(workspace))

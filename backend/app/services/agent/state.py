@@ -77,3 +77,20 @@ class AgentState(TypedDict, total=False):
     post_fix_reproduction_status: Optional[str]
     post_fix_reproduction_result: Optional[Dict[str, Any]]
     post_fix_reproduction_detail: Optional[str]
+    # Phase 6A: evidence-driven root-cause diagnosis, run once between
+    # retrieve and plan (and refreshed on every retry) -- see
+    # app.services.agent.graph.diagnose_node. Advisory only: plan_node may
+    # use a DIAGNOSED result to inform its Gemini patch prompt, but a
+    # missing/failed/insufficient diagnosis must never block or alter patch
+    # generation, and diagnosis must never affect finalize_node/
+    # should_continue. "DIAGNOSED" | "INSUFFICIENT_EVIDENCE" |
+    # "DIAGNOSIS_FAILED" -- see app.services.diagnosis.DiagnosisStatus.
+    # DIAGNOSIS_FAILED is a process failure, never a verdict; it must never
+    # be treated as equivalent to INSUFFICIENT_EVIDENCE.
+    diagnosis_status: Optional[str]
+    # The full app.services.diagnosis.Diagnosis.to_dict() when diagnosis
+    # actually produced a result (None before diagnose_node first runs).
+    diagnosis: Optional[Dict[str, Any]]
+    # Human-readable explanation of diagnosis_status, always set once
+    # diagnose_node has run.
+    diagnosis_detail: Optional[str]

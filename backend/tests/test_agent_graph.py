@@ -36,6 +36,20 @@ def _not_applicable_baseline_response() -> MagicMock:
     return response
 
 
+def _no_evidence_diagnosis_response() -> MagicMock:
+    """The full graph now also runs a real (mocked, per-test) diagnosis
+    Gemini call on every pass between retrieve and plan -- see
+    app.services.agent.graph.diagnose_node. Tests below that patch
+    genai.Client with a scripted call queue for patch generation must
+    account for this extra call before each patch-generation call; a
+    genuine no-evidence-shaped response keeps it advisory-inert for tests
+    that aren't exercising diagnosis behavior itself (see
+    test_agent_diagnosis_integration.py for tests that do)."""
+    response = MagicMock()
+    response.text = json.dumps({"summary": "", "hypotheses": [], "confidence": "no_evidence"})
+    return response
+
+
 def test_validate_patch_and_malformed_rejection():
     """Test patch validation logic rejects malformed inputs safely."""
     # Valid whole-file replacement
@@ -225,7 +239,9 @@ async def test_agent_graph_retry_path_analyze_failure_to_plan():
         mock_client = MagicMock()
         mock_client.models.generate_content.side_effect = [
             _not_applicable_baseline_response(),
+            _no_evidence_diagnosis_response(),
             response_attempt_1,
+            _no_evidence_diagnosis_response(),
             response_attempt_2,
         ]
 
@@ -310,7 +326,13 @@ async def test_retry_causes_fresh_retrieval_and_context():
         resp2.text = json.dumps([{"file_path": "counter.py", "code": "count = 5\n", "start_line": 1, "end_line": 1}])
 
         mock_client = MagicMock()
-        mock_client.models.generate_content.side_effect = [_not_applicable_baseline_response(), resp1, resp2]
+        mock_client.models.generate_content.side_effect = [
+            _not_applicable_baseline_response(),
+            _no_evidence_diagnosis_response(),
+            resp1,
+            _no_evidence_diagnosis_response(),
+            resp2,
+        ]
 
         initial_state = {
             "task_id": 20,
