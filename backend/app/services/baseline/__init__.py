@@ -29,6 +29,14 @@ site) with a ``ReproductionInput``:
         ),
     ))
     result.status  # BaselineStatus.REPRODUCED / NOT_REPRODUCED / ...
+
+PHASE 4B-1 additionally provides a standalone reproduction PLANNER (see
+``planner.py``/``plan_validator.py``): given a task description and
+``RepositoryEvidence``, ``plan_reproduction()`` proposes a ``ReproductionPlan``
+-- a safety-validated *proposal*, never itself executed, classified, or
+treated as evidence the bug exists. It does not call ``reproduce()`` and is
+not wired into the agent graph, task outcomes, or any API route; Phase 4B-2
+is responsible for turning a validated plan into a real ``ReproductionInput``.
 """
 
 from .classifier import classify
@@ -37,10 +45,18 @@ from .models import (
     BaselineResult,
     BaselineStatus,
     CommandObservation,
+    EvidenceReference,
     ExitCodeSemantics,
+    KnownCommand,
+    PlanValidationResult,
+    RepositoryEvidence,
     ReproductionExpectation,
     ReproductionInput,
+    ReproductionPlan,
+    ReproductionType,
 )
+from .plan_validator import validate_plan
+from .planner import plan_reproduction
 from .service import reproduce
 
 __all__ = [
@@ -48,11 +64,19 @@ __all__ = [
     "BaselineResult",
     "BaselineStatus",
     "CommandObservation",
+    "EvidenceReference",
     "ExitCodeSemantics",
+    "KnownCommand",
+    "PlanValidationResult",
+    "RepositoryEvidence",
     "ReproductionExpectation",
     "ReproductionInput",
+    "ReproductionPlan",
+    "ReproductionType",
     "WorkspaceEscapeError",
     "bound_output",
     "classify",
+    "plan_reproduction",
     "reproduce",
+    "validate_plan",
 ]
