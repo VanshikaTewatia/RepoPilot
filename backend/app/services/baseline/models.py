@@ -309,3 +309,49 @@ class PlanValidationResult:
 
     valid: bool
     errors: List[str] = field(default_factory=list)
+
+
+# ===========================================================================
+# Phase 4B-2: plan -> execution-input bridge (models only -- see bridge.py).
+# ===========================================================================
+
+
+class BridgeOutcome(str, Enum):
+    """What ``bridge.build_reproduction_input`` produced.
+
+    Exactly mirrors the three-way distinction ``ReproductionPlan`` already
+    established in Phase 4B-1, extended with the one new thing the bridge
+    itself can discover (a real-workspace ecosystem/image conflict, or a
+    re-validation failure) -- folded into PLANNING_FAILED rather than a
+    fourth category, because it means exactly the same thing downstream:
+    "no executable input could be produced; this is not a verdict about the
+    bug."
+
+    - EXECUTABLE: a real ``ReproductionInput`` was produced.
+    - PLANNING_FAILED: covers both ``plan.planning_failed=True`` AND any
+      bridge-level failure (re-validation failure, workspace escape
+      re-detected against the real filesystem, an ecosystem/image conflict
+      with real detection). A future caller should map this to
+      ``BaselineStatus.UNABLE_TO_REPRODUCE`` -- never NOT_APPLICABLE or
+      NOT_REPRODUCED.
+    - NOT_APPLICABLE: ``plan.applicable=False`` and ``plan.planning_failed
+      =False`` -- a genuine verdict, preserved as-is.
+    """
+
+    EXECUTABLE = "executable"
+    PLANNING_FAILED = "planning_failed"
+    NOT_APPLICABLE = "not_applicable"
+
+
+@dataclass
+class PlanBridgeResult:
+    """Outcome of ``bridge.build_reproduction_input``.
+
+    ``reproduction_input`` is populated only when ``outcome=EXECUTABLE``.
+    The bridge never executes it -- that remains the caller's
+    responsibility (e.g. ``app.services.baseline.service.reproduce``).
+    """
+
+    outcome: BridgeOutcome
+    reproduction_input: Optional[ReproductionInput] = None
+    detail: str = ""

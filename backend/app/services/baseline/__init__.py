@@ -35,19 +35,30 @@ PHASE 4B-1 additionally provides a standalone reproduction PLANNER (see
 ``RepositoryEvidence``, ``plan_reproduction()`` proposes a ``ReproductionPlan``
 -- a safety-validated *proposal*, never itself executed, classified, or
 treated as evidence the bug exists. It does not call ``reproduce()`` and is
-not wired into the agent graph, task outcomes, or any API route; Phase 4B-2
-is responsible for turning a validated plan into a real ``ReproductionInput``.
+not wired into the agent graph, task outcomes, or any API route.
+
+PHASE 4B-2 provides the bridge from a validated plan to that
+``ReproductionInput`` (see ``bridge.py``): ``build_reproduction_input(plan,
+evidence, workspace_path)`` returns a ``PlanBridgeResult`` whose
+``outcome`` is EXECUTABLE / PLANNING_FAILED / NOT_APPLICABLE. It never
+executes anything itself -- it only decides whether a safe, unambiguous
+``ReproductionInput`` can be constructed. Nothing calls it yet; that
+integration (actually running the bridged input through ``reproduce()``)
+is Phase 4B-3.
 """
 
+from .bridge import build_reproduction_input
 from .classifier import classify
 from .executor import BaselineExecutor, WorkspaceEscapeError, bound_output
 from .models import (
     BaselineResult,
     BaselineStatus,
+    BridgeOutcome,
     CommandObservation,
     EvidenceReference,
     ExitCodeSemantics,
     KnownCommand,
+    PlanBridgeResult,
     PlanValidationResult,
     RepositoryEvidence,
     ReproductionExpectation,
@@ -63,10 +74,12 @@ __all__ = [
     "BaselineExecutor",
     "BaselineResult",
     "BaselineStatus",
+    "BridgeOutcome",
     "CommandObservation",
     "EvidenceReference",
     "ExitCodeSemantics",
     "KnownCommand",
+    "PlanBridgeResult",
     "PlanValidationResult",
     "RepositoryEvidence",
     "ReproductionExpectation",
@@ -75,6 +88,7 @@ __all__ = [
     "ReproductionType",
     "WorkspaceEscapeError",
     "bound_output",
+    "build_reproduction_input",
     "classify",
     "plan_reproduction",
     "reproduce",
