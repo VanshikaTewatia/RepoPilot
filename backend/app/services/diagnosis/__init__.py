@@ -10,11 +10,15 @@ Advisory only, by design:
     GitHub functionality -- it works purely from state already gathered by
     ``retrieve_node``/``analyze_failure_node``.
   - Diagnosis never blocks, gates, or otherwise influences ``finalize_node``
-    or ``should_continue``. A ``DIAGNOSIS_FAILED`` or
-    ``INSUFFICIENT_EVIDENCE`` result must never prevent, delay, or alter
-    patch generation -- ``plan_node`` falls back to the exact
-    pre-Phase-6A prompt whenever a valid ``DIAGNOSED`` result isn't
-    available.
+    or ``should_continue`` -- those two remain entirely unaware of
+    diagnosis. Patch generation itself, however, IS gated on diagnosis as
+    of Phase 6C: a ``DIAGNOSIS_FAILED`` or ``INSUFFICIENT_EVIDENCE`` result
+    is converted by ``app.services.patch_plan.plan_patches`` into
+    ``PatchPlanStatus.INSUFFICIENT_DIAGNOSIS``, which closes ``plan_node``'s
+    PLANNED-only allow-list gate on the Gemini patch-generation call --
+    see ``app.services.patch_plan``'s package docstring. There is no
+    fallback to a pre-Phase-6A/6C prompt; this is the intended
+    no-fabricated-fix behavior, not a bug.
   - Like ``ReproductionPlan.planning_failed`` (Phase 4B-1) and
     ``QuestionClass.classification_failed`` (QA classifier),
     ``DiagnosisStatus.DIAGNOSIS_FAILED`` is a process failure, never a

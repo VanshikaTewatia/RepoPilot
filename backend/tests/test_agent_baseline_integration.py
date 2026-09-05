@@ -302,12 +302,46 @@ async def test_full_graph_reaches_fixed_when_baseline_reproduced_and_fix_verifie
             encoding="utf-8",
         )
 
+        # Phase 6C: diagnose_node and patch_plan_node each also run a real
+        # (mocked) Gemini call between retrieve and plan_node's own patch-
+        # generation call -- genuine, parseable responses for both are
+        # required so plan_node's PLANNED-only allow-list gate actually
+        # opens and the real fix below is still generated.
+        diagnosis_response = MagicMock()
+        diagnosis_response.text = json.dumps({
+            "summary": "add() subtracts instead of adding.",
+            "hypotheses": [
+                {
+                    "rank": 1,
+                    "description": "Wrong operator in add().",
+                    "citations": [{"file_path": "math_lib.py", "start_line": 1, "end_line": 2, "symbol_name": "add"}],
+                }
+            ],
+            "confidence": "inferred",
+        })
+        patch_plan_response = MagicMock()
+        patch_plan_response.text = json.dumps({
+            "applicable": True,
+            "summary": "Fix the addition operator.",
+            "changes": [
+                {
+                    "file_path": "math_lib.py",
+                    "change_type": "modify",
+                    "description": "Change the subtraction operator to addition.",
+                    "rationale": "Matches the diagnosed cause.",
+                    "citations": [{"file_path": "math_lib.py", "start_line": 1, "end_line": 2, "symbol_name": "add"}],
+                    "symbols_affected": ["add"],
+                }
+            ],
+            "diagnosis_alignment": "Directly addresses the diagnosed operator bug.",
+            "confidence": "inferred",
+        })
         patch_response = MagicMock()
         patch_response.text = json.dumps([
             {"file_path": "math_lib.py", "code": "def add(a, b):\n    return a + b\n", "start_line": 1, "end_line": 2}
         ])
         mock_client = MagicMock()
-        mock_client.models.generate_content.return_value = patch_response
+        mock_client.models.generate_content.side_effect = [diagnosis_response, patch_plan_response, patch_response]
 
         plan = _applicable_plan()
         bridge_result = _executable_bridge_result(str(workspace))

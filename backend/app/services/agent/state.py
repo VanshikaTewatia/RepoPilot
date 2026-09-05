@@ -78,12 +78,16 @@ class AgentState(TypedDict, total=False):
     post_fix_reproduction_result: Optional[Dict[str, Any]]
     post_fix_reproduction_detail: Optional[str]
     # Phase 6A: evidence-driven root-cause diagnosis, run once between
-    # retrieve and plan (and refreshed on every retry) -- see
-    # app.services.agent.graph.diagnose_node. Advisory only: plan_node may
-    # use a DIAGNOSED result to inform its Gemini patch prompt, but a
-    # missing/failed/insufficient diagnosis must never block or alter patch
-    # generation, and diagnosis must never affect finalize_node/
-    # should_continue. "DIAGNOSED" | "INSUFFICIENT_EVIDENCE" |
+    # retrieve and patch_plan (and refreshed on every retry) -- see
+    # app.services.agent.graph.diagnose_node. Advisory only with respect to
+    # diagnosis itself: it must never affect finalize_node/should_continue.
+    # As of Phase 6C, however, this status IS consequential for patch
+    # generation -- a missing/failed/insufficient diagnosis is converted by
+    # app.services.patch_plan.plan_patches into
+    # PatchPlanStatus.INSUFFICIENT_DIAGNOSIS, which intentionally closes
+    # plan_node's PLANNED-only allow-list gate and prevents patch
+    # generation for this attempt (the no-fabricated-fix guarantee). See
+    # patch_plan_status below. "DIAGNOSED" | "INSUFFICIENT_EVIDENCE" |
     # "DIAGNOSIS_FAILED" -- see app.services.diagnosis.DiagnosisStatus.
     # DIAGNOSIS_FAILED is a process failure, never a verdict; it must never
     # be treated as equivalent to INSUFFICIENT_EVIDENCE.
@@ -94,3 +98,23 @@ class AgentState(TypedDict, total=False):
     # Human-readable explanation of diagnosis_status, always set once
     # diagnose_node has run.
     diagnosis_detail: Optional[str]
+    # Phase 6C: validated patch planning, run once between diagnose and plan
+    # (and refreshed on every retry) -- see
+    # app.services.agent.graph.patch_plan_node. "PLANNED" | "NOT_APPLICABLE" |
+    # "INSUFFICIENT_DIAGNOSIS" | "PLANNING_FAILED" -- see
+    # app.services.patch_plan.PatchPlanStatus. ONLY "PLANNED" may result in a
+    # Gemini patch-generation call (plan_node's allow-list gate); the other
+    # three all mean "no patch is generated this attempt", for distinct
+    # reasons preserved in patch_plan_detail (and, for the diagnosis-driven
+    # cases, in the still-intact diagnosis_status/diagnosis_detail fields) --
+    # never conflated with each other, and never read by finalize_node or
+    # should_continue.
+    patch_plan_status: Optional[str]
+    # The full app.services.patch_plan.PatchPlan.to_dict() when patch
+    # planning actually produced a result (None before patch_plan_node first
+    # runs). Never contains raw file content or a copy of retrieved_context
+    # -- citations are file/line pointers only.
+    patch_plan: Optional[Dict[str, Any]]
+    # Human-readable explanation of patch_plan_status, always set once
+    # patch_plan_node has run.
+    patch_plan_detail: Optional[str]

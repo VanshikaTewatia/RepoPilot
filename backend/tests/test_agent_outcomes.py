@@ -41,9 +41,42 @@ def _no_evidence_diagnosis_response() -> MagicMock:
     Gemini call on every pass between retrieve and plan -- see
     app.services.agent.graph.diagnose_node. A genuine no-evidence-shaped
     response keeps it advisory-inert for outcome tests that aren't
-    specifically exercising diagnosis behavior itself."""
+    specifically exercising diagnosis behavior itself.
+
+    Note: this still parses into a DIAGNOSED diagnosis (empty hypotheses,
+    confidence "no_evidence") -- only a parse/network failure produces
+    DIAGNOSIS_FAILED. So patch_plan_node (Phase 6C) still attempts its own
+    Gemini call after this -- see _planned_patch_plan_response() below.
+    """
     response = MagicMock()
     response.text = json.dumps({"summary": "", "hypotheses": [], "confidence": "no_evidence"})
+    return response
+
+
+def _planned_patch_plan_response() -> MagicMock:
+    """The full graph now also runs a real (mocked, per-test) patch-planning
+    Gemini call on every pass between diagnose and plan -- see
+    app.services.agent.graph.patch_plan_node. A genuine, minimal PLANNED
+    response opens plan_node's allow-list gate so the subsequent patch-
+    generation call is still reached, for outcome tests that aren't
+    specifically exercising patch-planning behavior itself."""
+    response = MagicMock()
+    response.text = json.dumps({
+        "applicable": True,
+        "summary": "Apply the targeted fix.",
+        "changes": [
+            {
+                "file_path": "placeholder.py",
+                "change_type": "modify",
+                "description": "Apply the fix.",
+                "rationale": "Addresses the reported issue.",
+                "citations": [],
+                "symbols_affected": [],
+            }
+        ],
+        "diagnosis_alignment": "Addresses the reported issue.",
+        "confidence": "inferred",
+    })
     return response
 
 
@@ -224,6 +257,7 @@ async def test_outcome_fixed_when_bug_confirmed_and_patch_verified():
         mock_client.models.generate_content.side_effect = [
             _not_applicable_baseline_response(),
             _no_evidence_diagnosis_response(),
+            _planned_patch_plan_response(),
             mock_response,
         ]
 

@@ -225,6 +225,12 @@ async def test_plan_node_passes_diagnosis_through_to_patch_generation():
             retrieved_context=[{"file_path": "cart.py", "content": "x", "total_lines": 1}],
             diagnosis_status="DIAGNOSED",
             diagnosis=_diagnosed().to_dict(),
+            # Phase 6C: plan_node only calls _generate_patches_with_gemini
+            # when patch planning already produced a validated PLANNED
+            # plan -- this test is about diagnosis passthrough, not patch
+            # planning itself, so the gate is opened directly.
+            patch_plan_status="PLANNED",
+            patch_plan=None,
         )
 
         with patch("app.services.agent.graph._generate_patches_with_gemini", return_value=[]) as mock_gen:
@@ -340,13 +346,20 @@ def test_finalize_node_absent_diagnosis_fields_preserves_prior_behavior():
 # 7. Full graph wiring: diagnose sits between retrieve and plan
 # ===========================================================================
 def test_build_agent_graph_includes_diagnose_between_retrieve_and_plan():
+    """Phase 6C inserts patch_plan between diagnose and plan
+    (diagnose -> patch_plan -> plan) -- see
+    test_agent_patch_plan_integration.py for the dedicated topology test
+    covering patch_plan's own placement. This test still confirms diagnose
+    sits directly after retrieve and that retrieve/diagnose no longer
+    connect straight to plan."""
     graph = agent_app.get_graph()
     node_names = set(graph.nodes.keys())
     assert "diagnose" in node_names
 
     edges = {(e.source, e.target) for e in graph.edges}
     assert ("retrieve", "diagnose") in edges
-    assert ("diagnose", "plan") in edges
+    assert ("diagnose", "patch_plan") in edges
+    assert ("diagnose", "plan") not in edges
     assert ("retrieve", "plan") not in edges
 
 
@@ -357,6 +370,23 @@ def test_build_agent_graph_includes_diagnose_between_retrieve_and_plan():
 # ===========================================================================
 @pytest.mark.asyncio
 async def test_full_graph_runs_diagnosis_and_still_reaches_fixed():
+    """Exercises the REAL (unmocked) diagnose_node AND patch_plan_node
+    wiring end to end, alongside a real, confirmed fix -- proving the
+    Phase 6A/6C additions don't break the existing FIXED path when
+    diagnosis and patch planning both genuinely succeed.
+
+    Phase 6C note: unlike before Phase 6C, a diagnosis/patch-planning
+    FAILURE can no longer "fall back" to a direct Gemini patch-generation
+    call -- plan_node's PLANNED-only allow-list gate means patch
+    generation is skipped entirely in that case (see
+    test_diagnosis_failed_alongside_reproduced_baseline_still_yields_fixed
+    for that scenario's OWN outcome-isolation proof, and
+    test_patch_plan_status_gates_patch_generation in
+    test_agent_patch_plan_integration.py for the gate itself). This test
+    is therefore scripted with genuine, parseable diagnosis and patch-plan
+    responses so the gate opens for real, rather than relying on a
+    diagnosis failure that would now legitimately prevent the fix.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         workspace = Path(tmpdir)
         code_file = workspace / "math_lib.py"
@@ -366,12 +396,41 @@ async def test_full_graph_runs_diagnosis_and_still_reaches_fixed():
             encoding="utf-8",
         )
 
+        diagnosis_response = MagicMock()
+        diagnosis_response.text = json.dumps({
+            "summary": "add() subtracts instead of adding.",
+            "hypotheses": [
+                {
+                    "rank": 1,
+                    "description": "Wrong operator in add().",
+                    "citations": [{"file_path": "math_lib.py", "start_line": 1, "end_line": 2, "symbol_name": "add"}],
+                }
+            ],
+            "confidence": "inferred",
+        })
+        patch_plan_response = MagicMock()
+        patch_plan_response.text = json.dumps({
+            "applicable": True,
+            "summary": "Fix the addition operator.",
+            "changes": [
+                {
+                    "file_path": "math_lib.py",
+                    "change_type": "modify",
+                    "description": "Change the subtraction operator to addition.",
+                    "rationale": "Matches the diagnosed cause.",
+                    "citations": [{"file_path": "math_lib.py", "start_line": 1, "end_line": 2, "symbol_name": "add"}],
+                    "symbols_affected": ["add"],
+                }
+            ],
+            "diagnosis_alignment": "Directly addresses the diagnosed operator bug.",
+            "confidence": "inferred",
+        })
         patch_response = MagicMock()
         patch_response.text = json.dumps([
             {"file_path": "math_lib.py", "code": "def add(a, b):\n    return a + b\n", "start_line": 1, "end_line": 2}
         ])
         mock_client = MagicMock()
-        mock_client.models.generate_content.return_value = patch_response
+        mock_client.models.generate_content.side_effect = [diagnosis_response, patch_plan_response, patch_response]
 
         plan = _applicable_plan()
         bridge_result = _executable_bridge_result(str(workspace))
@@ -384,14 +443,7 @@ async def test_full_graph_runs_diagnosis_and_still_reaches_fixed():
 
         # Baseline planning/execution is patched directly (exactly like
         # test_agent_baseline_integration.py's own full-graph test) so this
-        # test isolates diagnosis's real wiring. The single mocked Gemini
-        # client is shared by diagnosis and patch generation and only ever
-        # returns the patch-array JSON above -- so diagnosis genuinely
-        # fails to parse it as a diagnosis object (a real DIAGNOSIS_FAILED,
-        # exercising the actual diagnose_node wiring end to end) while
-        # patch generation, which expects exactly this shape, succeeds.
-        # This is itself the regression under test: a real diagnosis
-        # failure alongside a real, confirmed fix must still reach FIXED.
+        # test isolates diagnosis/patch-planning's real wiring.
         with patch("app.core.config.settings.gemini_api_key", "real_like_test_key_12345"), patch(
             "google.genai.Client", return_value=mock_client
         ), patch("app.services.agent.graph.plan_reproduction", return_value=plan), patch(
@@ -402,6 +454,7 @@ async def test_full_graph_runs_diagnosis_and_still_reaches_fixed():
         ):
             final_state = await agent_app.ainvoke(initial_state)
 
-        assert final_state["diagnosis_status"] in ("DIAGNOSED", "DIAGNOSIS_FAILED", "INSUFFICIENT_EVIDENCE")
+        assert final_state["diagnosis_status"] == "DIAGNOSED"
+        assert final_state["patch_plan_status"] == "PLANNED"
         assert final_state["outcome"] == "FIXED"
         assert "return a + b" in code_file.read_text(encoding="utf-8")

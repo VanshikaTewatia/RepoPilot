@@ -27,6 +27,7 @@ from app.services.verification.project_analyzer import ProjectInfo, RepositoryAn
 from app.services.diagnosis import diagnose, DiagnosisStatus
 from app.services.agent.db import open_session
 from app.services.rag.retriever import CodeRetriever, RetrievalError, RetrievedChunk
+from app.services.patch_plan import plan_patches, PatchPlanStatus
 
 
 def validate_patch(patch: Any, workspace_dir: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -196,12 +197,50 @@ def _format_diagnosis_for_prompt(diagnosis: Dict[str, Any]) -> str:
     return "\n".join(lines) + "\n\n"
 
 
+def _format_patch_plan_for_prompt(patch_plan: Dict[str, Any]) -> str:
+    """Render a validated, PLANNED ``PatchPlan.to_dict()`` as an advisory
+    prompt section for ``_generate_patches_with_gemini``.
+
+    Returns "" when there is nothing substantive to add (e.g. an empty
+    summary and no changes) so the caller never appends a hollow section --
+    same guarantee as ``_format_diagnosis_for_prompt``.
+    """
+    summary = patch_plan.get("summary") or ""
+    changes = patch_plan.get("changes") or []
+    if not summary and not changes:
+        return ""
+
+    lines = [
+        "Proposed Patch Plan (guidance only -- verify against the actual code "
+        "above before applying; do not blindly follow if it conflicts with "
+        "what you observe):"
+    ]
+    if summary:
+        lines.append(summary)
+    diagnosis_alignment = patch_plan.get("diagnosis_alignment")
+    if diagnosis_alignment:
+        lines.append(f"Alignment with diagnosis: {diagnosis_alignment}")
+    for change in changes:
+        citations = change.get("citations") or []
+        citation_str = ", ".join(
+            f"{c.get('file_path')}:{c.get('start_line')}-{c.get('end_line')}" for c in citations
+        )
+        line = f"- [{change.get('change_type')}] {change.get('file_path')}: {change.get('description', '')}"
+        if change.get("rationale"):
+            line += f" (rationale: {change['rationale']})"
+        if citation_str:
+            line += f" (evidence: {citation_str})"
+        lines.append(line)
+    return "\n".join(lines) + "\n\n"
+
+
 def _generate_patches_with_gemini(
     task_description: str,
     retrieved_context: List[Dict[str, Any]],
     error_analysis: Optional[str] = None,
     workspace_dir: Optional[str] = None,
     diagnosis: Optional[Dict[str, Any]] = None,
+    patch_plan: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Generate structured code patches using Gemini LLM."""
     if not settings.gemini_api_key or settings.gemini_api_key.startswith("test") or settings.gemini_api_key.startswith("mock"):
@@ -252,6 +291,9 @@ def _generate_patches_with_gemini(
 
     if diagnosis and diagnosis.get("status") == DiagnosisStatus.DIAGNOSED.value:
         prompt += _format_diagnosis_for_prompt(diagnosis)
+
+    if patch_plan and patch_plan.get("status") == PatchPlanStatus.PLANNED.value:
+        prompt += _format_patch_plan_for_prompt(patch_plan)
 
     prompt += "Generate the JSON patch array now:"
 
@@ -722,14 +764,18 @@ async def retrieve_node(state: AgentState) -> Dict[str, Any]:
 async def diagnose_node(state: AgentState) -> Dict[str, Any]:
     """Evidence-driven root-cause diagnosis (Phase 6A) -- advisory only.
 
-    Runs once between retrieve_node and plan_node, and again on every retry
-    (analyze_failure -> retrieve -> diagnose -> plan), always working from
-    the freshly retrieved_context and the current error_analysis so a
-    diagnosis never goes stale across attempts. This is evidence gathering
-    ONLY -- it never itself proposes a patch, and a DIAGNOSIS_FAILED or
-    INSUFFICIENT_EVIDENCE result must never block or alter plan_node's
-    existing patch-generation behavior; see app.services.diagnosis's
-    package docstring. Never calls reproduction, Docker, workspace
+    Runs once between retrieve_node and patch_plan_node, and again on every
+    retry (analyze_failure -> retrieve -> diagnose -> patch_plan -> plan),
+    always working from the freshly retrieved_context and the current
+    error_analysis so a diagnosis never goes stale across attempts. This is
+    evidence gathering ONLY -- it never itself proposes a patch. As of
+    Phase 6C, a DIAGNOSIS_FAILED or INSUFFICIENT_EVIDENCE result IS
+    consequential for patch generation: app.services.patch_plan.plan_patches
+    converts it into PatchPlanStatus.INSUFFICIENT_DIAGNOSIS, which closes
+    plan_node's PLANNED-only allow-list gate on the Gemini patch-generation
+    call -- see app.services.patch_plan's package docstring. Diagnosis
+    itself still never blocks, gates, or otherwise influences finalize_node
+    or should_continue. Never calls reproduction, Docker, workspace
     creation, or remote code-hosting functionality, and never raises -- a
     failure here must never crash the task.
     """
@@ -759,12 +805,69 @@ async def diagnose_node(state: AgentState) -> Dict[str, Any]:
     }
 
 
+async def patch_plan_node(state: AgentState) -> Dict[str, Any]:
+    """Validated patch planning (Phase 6C) -- advisory guidance only.
+
+    Runs once between diagnose_node and plan_node, and again on every retry
+    (analyze_failure -> retrieve -> diagnose -> patch_plan -> plan), always
+    working from the freshly diagnosed root cause, retrieved_context, and
+    current error_analysis so a plan never goes stale across attempts.
+    Never itself a diff, never passed to edit_node/apply_patch -- it is
+    purely advisory input to plan_node's existing Gemini patch-generation
+    prompt (see plan_node's PLANNED-only allow-list gate). Never calls
+    reproduction, Docker, workspace creation, or remote code-hosting
+    functionality, and never raises -- a failure here must never crash the
+    task, and must never affect finalize_node's outcome or should_continue's
+    retry routing (patch_plan_status is read by neither).
+    """
+    task_description = state.get("task_description", "")
+    diagnosis = state.get("diagnosis")
+    retrieved_context = state.get("retrieved_context") or []
+    error_analysis = state.get("error_analysis")
+
+    try:
+        result = await plan_patches(
+            task_description=task_description,
+            diagnosis=diagnosis,
+            retrieved_context=retrieved_context,
+            error_analysis=error_analysis,
+        )
+    except Exception as e:  # noqa: BLE001 -- patch planning is advisory-only and must never crash the task
+        logger.warning(f"Patch planning failed unexpectedly: {e}")
+        return {
+            "patch_plan_status": PatchPlanStatus.PLANNING_FAILED.value,
+            "patch_plan": None,
+            "patch_plan_detail": f"Patch planning failed unexpectedly: {e}",
+        }
+
+    detail = result.summary or result.failure_reason or result.status.value
+    return {
+        "patch_plan_status": result.status.value,
+        "patch_plan": result.to_dict(),
+        "patch_plan_detail": detail,
+    }
+
+
 def plan_node(state: AgentState) -> Dict[str, Any]:
-    """Generate repair plan and structured proposed patches based on fresh context."""
+    """Generate repair plan and structured proposed patches based on fresh context.
+
+    Phase 6C: Gemini patch generation is now gated behind an ALLOW-LIST
+    check on patch_plan_status -- ONLY "PLANNED" (a validated, evidence-
+    grounded plan) may result in a Gemini call this attempt. Every other
+    status ("NOT_APPLICABLE", "INSUFFICIENT_DIAGNOSIS", "PLANNING_FAILED",
+    or absent) means no patch is generated this attempt -- proposed_patches
+    is set to [] directly, with no Gemini call and no stale-patch reuse
+    from a prior attempt. This is deliberately an allow-list (not a
+    denylist of known-bad statuses) so no current or future status can
+    accidentally fall through to patch generation. See
+    app.services.patch_plan's package docstring for the full rationale.
+    """
     desc = state["task_description"]
     workspace = state.get("workspace_dir", "")
     error_analysis = state.get("error_analysis")
     diagnosis = state.get("diagnosis")
+    patch_plan = state.get("patch_plan")
+    patch_plan_status = state.get("patch_plan_status")
 
     # Always ensure retrieved_context contains the latest file content from disk
     fresh_retrieved: List[Dict[str, Any]] = []
@@ -780,31 +883,25 @@ def plan_node(state: AgentState) -> Dict[str, Any]:
         else:
             fresh_retrieved.append(item)
 
-    # Generate new patches using fresh context
-    if error_analysis:
+    if patch_plan_status == PatchPlanStatus.PLANNED.value:
         patches = _generate_patches_with_gemini(
             task_description=desc,
             retrieved_context=fresh_retrieved,
             error_analysis=error_analysis,
             workspace_dir=workspace,
             diagnosis=diagnosis,
+            patch_plan=patch_plan,
         )
+        files_str = ", ".join(c["file_path"] for c in fresh_retrieved)
+        patch_summary = f"Generated {len(patches)} patch(es)" if patches else "No valid patches generated"
+        plan = f"Plan for '{desc}': Targets [{files_str}]. {patch_summary}."
     else:
-        existing_patches = state.get("proposed_patches")
-        if existing_patches:
-            patches = existing_patches
-        else:
-            patches = _generate_patches_with_gemini(
-                task_description=desc,
-                retrieved_context=fresh_retrieved,
-                error_analysis=None,
-                workspace_dir=workspace,
-                diagnosis=diagnosis,
-            )
+        patches = []
+        plan = (
+            f"No patch generated for '{desc}': patch planning status is "
+            f"{patch_plan_status or 'absent'} ({state.get('patch_plan_detail') or 'no detail'})."
+        )
 
-    files_str = ", ".join(c["file_path"] for c in fresh_retrieved)
-    patch_summary = f"Generated {len(patches)} patch(es)" if patches else "No valid patches generated"
-    plan = f"Plan for '{desc}': Targets [{files_str}]. {patch_summary}."
     return {
         "status": "planning",
         "repair_plan": plan,
@@ -1126,6 +1223,7 @@ def build_agent_graph():
     builder.add_node("baseline", baseline_node)
     builder.add_node("retrieve", retrieve_node)
     builder.add_node("diagnose", diagnose_node)
+    builder.add_node("patch_plan", patch_plan_node)
     builder.add_node("plan", plan_node)
     builder.add_node("edit", edit_node)
     builder.add_node("test", test_node)
@@ -1138,7 +1236,8 @@ def build_agent_graph():
     builder.add_edge("investigate", "baseline")
     builder.add_edge("baseline", "retrieve")
     builder.add_edge("retrieve", "diagnose")
-    builder.add_edge("diagnose", "plan")
+    builder.add_edge("diagnose", "patch_plan")
+    builder.add_edge("patch_plan", "plan")
     builder.add_edge("plan", "edit")
     builder.add_edge("edit", "test")
     builder.add_edge("test", "verify")

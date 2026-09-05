@@ -44,9 +44,47 @@ def _no_evidence_diagnosis_response() -> MagicMock:
     account for this extra call before each patch-generation call; a
     genuine no-evidence-shaped response keeps it advisory-inert for tests
     that aren't exercising diagnosis behavior itself (see
-    test_agent_diagnosis_integration.py for tests that do)."""
+    test_agent_diagnosis_integration.py for tests that do).
+
+    Note: this still parses into a DIAGNOSED diagnosis (with empty
+    hypotheses and confidence "no_evidence") -- diagnoser.py always
+    produces DIAGNOSED for any successfully-parsed response; only a
+    parse/network failure produces DIAGNOSIS_FAILED. So patch_plan_node
+    (Phase 6C) still attempts its own Gemini call after this -- see
+    _planned_patch_plan_response() below.
+    """
     response = MagicMock()
     response.text = json.dumps({"summary": "", "hypotheses": [], "confidence": "no_evidence"})
+    return response
+
+
+def _planned_patch_plan_response() -> MagicMock:
+    """The full graph now also runs a real (mocked, per-test) patch-planning
+    Gemini call on every pass between diagnose and plan -- see
+    app.services.agent.graph.patch_plan_node. Tests below that patch
+    genai.Client with a scripted call queue for patch generation must
+    account for this extra call before each patch-generation call. A
+    genuine, minimal PLANNED response opens plan_node's allow-list gate so
+    the subsequent patch-generation call is still reached, for tests that
+    aren't exercising patch-planning behavior itself (see
+    test_agent_patch_plan_integration.py for tests that do)."""
+    response = MagicMock()
+    response.text = json.dumps({
+        "applicable": True,
+        "summary": "Apply the targeted fix.",
+        "changes": [
+            {
+                "file_path": "placeholder.py",
+                "change_type": "modify",
+                "description": "Apply the fix.",
+                "rationale": "Addresses the reported issue.",
+                "citations": [],
+                "symbols_affected": [],
+            }
+        ],
+        "diagnosis_alignment": "Addresses the reported issue.",
+        "confidence": "inferred",
+    })
     return response
 
 
@@ -130,6 +168,12 @@ def test_plan_node_generates_patches_from_mocked_gemini():
             {"file_path": "src/order_service.py", "content": "def calculate_order_total():\n    pass", "total_lines": 50}
         ],
         "error_analysis": None,
+        # Phase 6C: plan_node only calls Gemini for patches when patch
+        # planning already produced a validated PLANNED plan -- this test
+        # is specifically about plan_node's OWN patch-generation call, not
+        # patch planning itself, so the gate is opened directly.
+        "patch_plan_status": "PLANNED",
+        "patch_plan": None,
     }
 
     with patch("app.core.config.settings.gemini_api_key", "real_like_test_key_12345"):
@@ -240,8 +284,10 @@ async def test_agent_graph_retry_path_analyze_failure_to_plan():
         mock_client.models.generate_content.side_effect = [
             _not_applicable_baseline_response(),
             _no_evidence_diagnosis_response(),
+            _planned_patch_plan_response(),
             response_attempt_1,
             _no_evidence_diagnosis_response(),
+            _planned_patch_plan_response(),
             response_attempt_2,
         ]
 
@@ -329,8 +375,10 @@ async def test_retry_causes_fresh_retrieval_and_context():
         mock_client.models.generate_content.side_effect = [
             _not_applicable_baseline_response(),
             _no_evidence_diagnosis_response(),
+            _planned_patch_plan_response(),
             resp1,
             _no_evidence_diagnosis_response(),
+            _planned_patch_plan_response(),
             resp2,
         ]
 

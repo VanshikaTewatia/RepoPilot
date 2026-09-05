@@ -337,11 +337,34 @@ async def test_full_graph_retry_never_reruns_baseline_or_creates_a_second_worksp
         # this test isn't exercising diagnosis behavior itself.
         no_evidence_diagnosis_response = MagicMock()
         no_evidence_diagnosis_response.text = json.dumps({"summary": "", "hypotheses": [], "confidence": "no_evidence"})
+        # Phase 6C: patch_plan_node also runs a real (mocked) Gemini call on
+        # every pass between diagnose and plan -- a genuine, minimal
+        # PLANNED response opens plan_node's allow-list gate so the
+        # subsequent patch-generation response is still reached.
+        planned_patch_plan_response = MagicMock()
+        planned_patch_plan_response.text = json.dumps({
+            "applicable": True,
+            "summary": "Apply the targeted fix.",
+            "changes": [
+                {
+                    "file_path": "math_lib.py",
+                    "change_type": "modify",
+                    "description": "Apply the fix.",
+                    "rationale": "Addresses the reported issue.",
+                    "citations": [],
+                    "symbols_affected": [],
+                }
+            ],
+            "diagnosis_alignment": "Addresses the reported issue.",
+            "confidence": "inferred",
+        })
         mock_client = MagicMock()
         mock_client.models.generate_content.side_effect = [
             no_evidence_diagnosis_response,
+            planned_patch_plan_response,
             empty_response,
             no_evidence_diagnosis_response,
+            planned_patch_plan_response,
             fix_response,
         ]
 
