@@ -185,6 +185,48 @@ class VerificationEngine:
         # settings; Python verification also delegates its execution to it.
         self._docker_runner = DockerTestRunner(timeout=self.timeout, network_mode=self.network_mode)
 
+    def execute_command(
+        self,
+        workspace: Path | str,
+        command: List[str],
+        image: Optional[str] = None,
+        timeout: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Run an arbitrary command with the same sandboxing guarantees as
+        verification (Docker when available, hardened subprocess fallback
+        otherwise; toolchain preflight; timeout handling; cleanup) -- but
+        with no ecosystem detection and no pass/fail interpretation. Returns
+        raw execution facts only.
+
+        Intended for callers that need a command run that isn't a
+        verification adapter's own test command (e.g.
+        app.services.baseline's reproduction executor), without duplicating
+        any of the Docker/subprocess execution machinery below.
+        """
+        workspace_path = Path(workspace).resolve()
+        exec_image = image or self._docker_runner.image
+
+        # `timeout` is passed straight through to the execution methods below
+        # rather than mutating `self.timeout` -- this engine instance may be
+        # reused across multiple execute_command() calls (e.g. one per
+        # baseline reproduction command), and mutating shared instance state
+        # for the duration of a call is not safe if two such calls are ever
+        # in flight concurrently on the same engine.
+        if self._docker_runner.is_docker_available:
+            output, exit_code = self._execute_in_docker(
+                workspace_path, exec_image, None, command, timeout=timeout
+            )
+        else:
+            output, exit_code = self._execute_in_subprocess(
+                workspace_path, None, command, timeout=timeout
+            )
+
+        return {
+            "output": output,
+            "exit_code": exit_code,
+            "toolchain_missing": _extract_missing_toolchain(output),
+        }
+
     def verify(self, workspace_path: Path | str, test_path: Optional[str] = None) -> Dict[str, Any]:
         """Detect the workspace's ecosystem and run its verification command."""
         workspace = Path(workspace_path).resolve()
@@ -435,6 +477,7 @@ class VerificationEngine:
         image: str,
         install_argv: Optional[List[str]],
         test_argv: List[str],
+        timeout: Optional[int] = None,
     ) -> Tuple[str, int]:
         """Run install + test commands in an ephemeral Docker container.
 
@@ -460,13 +503,18 @@ class VerificationEngine:
         (``_INSTALL_LIED_ABOUT_SUCCESS_MARKER``), so its own output is
         checked too.
 
-        Execution is bounded by ``self.timeout`` using the Docker SDK's own
-        timeout mechanism, ``Container.wait(timeout=...)``: the synchronous
-        ``containers.run()`` helper has no way to bound how long it blocks,
-        so this uses the equivalent manual create/start/wait/logs/remove
-        sequence instead. A hung install or test is killed and reported as a
-        clean timeout rather than blocking indefinitely.
+        Execution is bounded by ``timeout`` (falling back to ``self.timeout``
+        when not given -- every existing caller omits it and gets identical
+        behavior to before) using the Docker SDK's own timeout mechanism,
+        ``Container.wait(timeout=...)``: the synchronous ``containers.run()``
+        helper has no way to bound how long it blocks, so this uses the
+        equivalent manual create/start/wait/logs/remove sequence instead. A
+        hung install or test is killed and reported as a clean timeout
+        rather than blocking indefinitely. Passed through explicitly rather
+        than mutating ``self.timeout`` so concurrent calls on the same
+        engine instance can never leak a custom timeout into one another.
         """
+        effective_timeout = timeout if timeout is not None else self.timeout
         script_parts = [_preflight_snippet(test_argv[0])]
         if install_argv:
             install_cmd = " ".join(install_argv)
@@ -497,16 +545,16 @@ class VerificationEngine:
                 user="1000:1000",
             )
             try:
-                wait_result = container.wait(timeout=self.timeout)
+                wait_result = container.wait(timeout=effective_timeout)
             except _DOCKER_WAIT_TIMEOUT_EXCEPTIONS:
                 logger.warning(
-                    f"Docker verification run exceeded {self.timeout}s timeout; killing container."
+                    f"Docker verification run exceeded {effective_timeout}s timeout; killing container."
                 )
                 try:
                     container.kill()
                 except (DockerException, APIError):
                     pass
-                return f"Verification timed out after {self.timeout} seconds.", 124
+                return f"Verification timed out after {effective_timeout} seconds.", 124
 
             exit_code = wait_result.get("StatusCode", 1)
             raw = container.logs(stdout=True, stderr=True)
@@ -520,7 +568,7 @@ class VerificationEngine:
             # never silently reports success without the tool actually
             # existing somewhere it was run.
             logger.info(f"Docker verification run unavailable ({e}); falling back to subprocess.")
-            return self._execute_in_subprocess(workspace, install_argv, test_argv)
+            return self._execute_in_subprocess(workspace, install_argv, test_argv, timeout=timeout)
         finally:
             # Explicit removal (rather than run()'s remove=True/auto_remove)
             # since detach=True is required to apply our own wait() timeout.
@@ -531,7 +579,11 @@ class VerificationEngine:
                     pass
 
     def _execute_in_subprocess(
-        self, workspace: Path, install_argv: Optional[List[str]], test_argv: List[str]
+        self,
+        workspace: Path,
+        install_argv: Optional[List[str]],
+        test_argv: List[str],
+        timeout: Optional[int] = None,
     ) -> Tuple[str, int]:
         """Run install (best-effort) + test commands as local subprocesses, cwd=workspace.
 
@@ -552,6 +604,7 @@ class VerificationEngine:
         failed, so a hard "dependencies unavailable" verdict isn't
         warranted.
         """
+        effective_timeout = timeout if timeout is not None else self.timeout
         if not _tool_is_available(test_argv[0], workspace):
             return (
                 f"{_TOOLCHAIN_MISSING_SENTINEL}{test_argv[0]}\n"
@@ -568,7 +621,7 @@ class VerificationEngine:
                     cwd=workspace,
                     capture_output=True,
                     text=True,
-                    timeout=min(self.timeout, _INSTALL_TIMEOUT_SECONDS),
+                    timeout=min(effective_timeout, _INSTALL_TIMEOUT_SECONDS),
                 )
                 install_log = (
                     f"$ {' '.join(install_argv)}\n{install_result.stdout}\n{install_result.stderr}"
@@ -586,13 +639,13 @@ class VerificationEngine:
                 cwd=workspace,
                 capture_output=True,
                 text=True,
-                timeout=self.timeout,
+                timeout=effective_timeout,
             )
             combined = f"{install_log}\n\n{result.stdout}\n{result.stderr}".strip()
             return combined, result.returncode
         except subprocess.TimeoutExpired:
             return (
-                f"{install_log}\n\nExecution timed out after {self.timeout} seconds.".strip(),
+                f"{install_log}\n\nExecution timed out after {effective_timeout} seconds.".strip(),
                 124,
             )
         except FileNotFoundError as e:
