@@ -500,3 +500,77 @@ def test_finalize_node_baseline_gate_does_not_affect_failed_branch():
     }
     out = finalize_node(state)
     assert out["outcome"] == "FAILED"
+
+
+# ===========================================================================
+# Phase 6D: a REPRODUCED baseline is positive evidence the reported bug is
+# real -- it must never be silently overridden by the "no real code change"
+# NO_CHANGE_NEEDED branches, which would otherwise claim the opposite of
+# what baseline reproduction just established.
+# ===========================================================================
+def test_finalize_node_reproduced_baseline_with_zero_patches_is_failed_not_no_change_needed():
+    """No patches were generated this attempt, but baseline independently
+    proved the reported bug is real -- NO_CHANGE_NEEDED would falsely claim
+    the behavior was already correct or unsubstantiated. FAILED is correct:
+    the issue is real and was not fixed this attempt."""
+    state = {
+        "test_results": {"available": True, "success": True, "failed": 0},
+        "proposed_patches": [],
+        "is_verified": True,
+        "baseline_status": "REPRODUCED",
+    }
+    out = finalize_node(state)
+    assert out["outcome"] == "FAILED"
+    assert out["outcome"] != "NO_CHANGE_NEEDED"
+    assert out["outcome"] != "FIXED"
+    assert "no patch was generated" in out["outcome_detail"]
+
+
+def test_finalize_node_reproduced_baseline_with_zero_applied_patches_is_failed_not_no_change_needed():
+    """Patches were generated but none actually applied -- same masking bug
+    as the zero-patches case, via the OTHER "no real code change" branch."""
+    state = {
+        "test_results": {"available": True, "success": True, "failed": 0},
+        "proposed_patches": [{"file_path": "a.py", "code": "x = 1\n"}],
+        "applied_patch_count": 0,
+        "is_verified": True,
+        "baseline_status": "REPRODUCED",
+    }
+    out = finalize_node(state)
+    assert out["outcome"] == "FAILED"
+    assert out["outcome"] != "NO_CHANGE_NEEDED"
+    assert out["outcome"] != "FIXED"
+    assert "none could be applied" in out["outcome_detail"]
+
+
+def test_finalize_node_reproduced_baseline_zero_patches_with_post_fix_reproduced_is_failed():
+    """The realistic full scenario: baseline REPRODUCED, no patch generated,
+    the general test suite still passes, and post-fix reproduction reruns
+    the identical check against the unchanged workspace and reconfirms the
+    bug is still there. post_fix_reproduction_status must not need to be
+    consulted for this to correctly resolve to FAILED -- there is no
+    applied change for it to be evidence about."""
+    state = {
+        "test_results": {"available": True, "success": True, "failed": 0},
+        "proposed_patches": [],
+        "is_verified": True,
+        "baseline_status": "REPRODUCED",
+        "post_fix_reproduction_status": "REPRODUCED",
+        "post_fix_reproduction_detail": "the same failure was observed again",
+    }
+    out = finalize_node(state)
+    assert out["outcome"] == "FAILED"
+
+
+def test_finalize_node_applied_patch_count_none_with_baseline_reproduced_unaffected_by_new_branch():
+    """Regression guard: applied_patch_count absent (unknown, not zero) with
+    a REPRODUCED baseline and a real, confirmed fix must still reach FIXED
+    -- the new Phase 6D branch's zero_applied/not-patches condition must
+    never fire just because applied_patch_count is unset."""
+    state = _verified_with_applied_patch_state(
+        baseline_status="REPRODUCED",
+        post_fix_reproduction_status="NOT_REPRODUCED",
+        applied_patch_count=None,
+    )
+    out = finalize_node(state)
+    assert out["outcome"] == "FIXED"

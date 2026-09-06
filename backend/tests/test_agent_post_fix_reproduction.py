@@ -431,3 +431,71 @@ def test_no_github_integration_module_is_touched_by_post_fix_reproduction():
     with open(source, "r", encoding="utf-8") as f:
         contents = f.read()
     assert "github" not in contents.lower()
+
+
+# ===========================================================================
+# 15. Phase 6D end-to-end regression: baseline REPRODUCED + zero patches
+# generated this attempt (real diagnosis failure closes the Phase 6C
+# patch-planning gate) + a general test suite that passes regardless (it
+# doesn't cover the specific reported bug) + post-fix reproduction reruns
+# the identical check and reconfirms the bug is still there. Before Phase
+# 6D, finalize_node's "is_verified and not patches" branch fired first and
+# reported NO_CHANGE_NEEDED, directly contradicting the REPRODUCED/
+# RE-REPRODUCED evidence just gathered. Must now resolve to FAILED.
+# ===========================================================================
+@pytest.mark.asyncio
+async def test_full_graph_reproduced_baseline_with_no_patch_and_reconfirmed_bug_is_failed_not_no_change_needed():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        workspace = Path(tmpdir)
+        (workspace / "math_lib.py").write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
+        # A general test suite that passes regardless of any patch -- it
+        # does not exercise the specific reported bug, exactly the gap
+        # post_fix_reproduction_node exists to close (see its own
+        # docstring: "a passing full test suite ... never re-confirms that
+        # the SPECIFIC failure baseline demonstrated is actually gone").
+        (workspace / "test_unrelated.py").write_text(
+            "def test_trivially_passes():\n    assert 1 == 1\n",
+            encoding="utf-8",
+        )
+
+        # A malformed (non-JSON-object) diagnosis response -- diagnosis
+        # genuinely fails to parse, so patch_plan_node never even attempts
+        # its own Gemini call (INSUFFICIENT_DIAGNOSIS is returned
+        # deterministically), and plan_node's PLANNED-only gate stays
+        # closed: proposed_patches == [] this attempt, with no third
+        # (patch-generation) Gemini call ever made.
+        malformed_response = MagicMock()
+        malformed_response.text = json.dumps(["not", "an", "object"])
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = malformed_response
+
+        plan = _applicable_plan()
+        bridge_result = _executable_bridge_result(str(workspace))
+        baseline_reproduce_result = BaselineResult(status=BaselineStatus.REPRODUCED, detail="reproduced", exit_code=1)
+        post_fix_reproduce_result = BaselineResult(
+            status=BaselineStatus.REPRODUCED, detail="the same failure was observed again", exit_code=1
+        )
+
+        initial_state = _base_state(workspace, "The add() function in math_lib.py returns the wrong result.")
+
+        with patch("app.core.config.settings.gemini_api_key", "real_like_test_key_12345"), patch(
+            "google.genai.Client", return_value=mock_client
+        ), patch("app.services.agent.graph.plan_reproduction", return_value=plan), patch(
+            "app.services.agent.graph.build_reproduction_input", return_value=bridge_result
+        ), patch(
+            "app.services.agent.graph.reproduce",
+            side_effect=[baseline_reproduce_result, post_fix_reproduce_result],
+        ):
+            final_state = await agent_app.ainvoke(initial_state)
+
+        assert final_state["diagnosis_status"] == "DIAGNOSIS_FAILED"
+        assert final_state["patch_plan_status"] == "INSUFFICIENT_DIAGNOSIS"
+        assert final_state["proposed_patches"] == []
+        assert final_state["is_verified"] is True
+        assert final_state["baseline_status"] == "REPRODUCED"
+        assert final_state["post_fix_reproduction_status"] == "REPRODUCED"
+        assert final_state["outcome"] == "FAILED"
+        assert final_state["outcome"] != "NO_CHANGE_NEEDED"
+        assert final_state["outcome"] != "FIXED"
+        # the file is genuinely untouched -- no fabricated fix was ever applied
+        assert (workspace / "math_lib.py").read_text(encoding="utf-8") == "def add(a, b):\n    return a - b\n"

@@ -1106,6 +1106,27 @@ def finalize_node(state: AgentState) -> Dict[str, Any]:
     never sufficient by itself to claim the *specific* previously-reproduced
     failure is gone. This never widens which tasks can reach FIXED, only
     narrows the one REPRODUCED case further.
+
+    Phase 6D: a ``REPRODUCED`` baseline is positive, independently-executed
+    evidence that the reported bug is real (see
+    ``app.services.baseline``'s own docstring) -- it must never be silently
+    overridden by the "no real code change" branches below. Whenever
+    ``baseline_status == "REPRODUCED"`` and no real fix was actually applied
+    this attempt (no patches were generated, or none of the generated
+    patches actually applied -- the exact same ``zero_applied``/``not
+    patches`` conditions the NO_CHANGE_NEEDED branches below use), the
+    outcome is FAILED, not NO_CHANGE_NEEDED: claiming NO_CHANGE_NEEDED here
+    would directly contradict the REPRODUCED evidence just gathered (it
+    specifically asserts "already correct or could not be substantiated"),
+    and FIXED is already correctly barred by the missing applied patch.
+    This is checked BEFORE the NO_CHANGE_NEEDED branches and is the only
+    behavioral change from Phase 6C -- every other ``baseline_status``
+    value (``None``, ``NOT_APPLICABLE``, ``UNABLE_TO_REPRODUCE``,
+    ``NOT_REPRODUCED``) still falls through to the unchanged
+    NO_CHANGE_NEEDED branches exactly as before, since those values are
+    either absent or inconclusive, never positive evidence the bug is
+    real. ``post_fix_reproduction_status`` is irrelevant to this branch --
+    there is no applied change for it to be evidence about.
     """
     test_res = state.get("test_results") or {}
     patches = state.get("proposed_patches") or []
@@ -1118,6 +1139,20 @@ def finalize_node(state: AgentState) -> Dict[str, Any]:
     if not test_res.get("available", True):
         outcome = "UNABLE_TO_VERIFY"
         detail = test_res.get("detail") or "Verification tooling was unavailable for this repository."
+    elif is_verified and baseline_status == "REPRODUCED" and (zero_applied or not patches):
+        # Baseline independently proved the reported bug exists. No real
+        # code change was made this attempt (no patches generated, or none
+        # applied) -- this can never be NO_CHANGE_NEEDED (that would
+        # contradict positive REPRODUCED evidence) and can never be FIXED
+        # (no applied patch). FAILED is the only outcome consistent with
+        # both facts, regardless of post_fix_reproduction_status.
+        outcome = "FAILED"
+        detail = (
+            "Baseline reproduction independently confirmed the reported issue "
+            "exists, but no real code change was applied this attempt "
+            f"({'patches were generated but none could be applied' if patches else 'no patch was generated'}), "
+            "so the reported issue has not been fixed."
+        )
     elif is_verified and zero_applied:
         outcome = "NO_CHANGE_NEEDED"
         detail = (
