@@ -118,7 +118,99 @@ def parse_and_validate_patches(raw_text: str, workspace_dir: Optional[str] = Non
         if val is not None:
             valid_patches.append(val)
 
-    return valid_patches
+    return _resolve_same_file_patch_conflicts(valid_patches)
+
+
+def _resolve_same_file_patch_conflicts(patches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Phase 6E: deterministically resolve multiple patches targeting the
+    SAME file so ``edit_node`` can never silently corrupt a file via stale
+    line numbers.
+
+    ``edit_node`` applies ``proposed_patches`` in list order, mutating the
+    file on disk after each successful ``apply_patch`` call -- but
+    ``validate_patch`` checks every patch's line range against the file's
+    ON-DISK state at validation time, BEFORE any patch in this attempt has
+    been applied. If two patches target the same file with different,
+    non-adjacent ranges, applying the first can shift or rewrite the content
+    the second patch's start_line/end_line were computed against, silently
+    corrupting the file on the second apply. This function is the
+    deterministic safety net: it NEVER modifies a patch's content or line
+    numbers (unlike ``patch_plan_validator``'s advisory-text repairs, which
+    never touch real files, anything that could change what actually gets
+    written to disk is only ever dropped, never rewritten) -- it only ever
+    DROPS a patch it cannot prove is safe to apply, and logs why.
+
+    Rules, applied per ``file_path`` (files keep their original
+    first-appearance order; a file with only one patch is always returned
+    unchanged and unlogged):
+      - If ANY patch for a file is a whole-file replacement (``start_line``
+        and ``end_line`` both ``None``), only the FIRST patch for that file
+        (by original list order, regardless of type) survives -- a
+        whole-file replacement makes every other line range to that file
+        meaningless to reason about.
+      - Otherwise (every patch for that file specifies an explicit range --
+        guaranteed by ``validate_patch``, which only ever accepts "both
+        None" or "both int"), a patch whose ``[start_line, end_line]``
+        overlaps an already-kept patch for the same file is dropped; the
+        first non-conflicting patch in list order always survives.
+      - Surviving same-file range patches are returned ordered DESCENDING
+        by ``start_line`` -- applying bottom-to-top means no not-yet-applied
+        patch's line numbers are ever invalidated by an earlier edit, since
+        an edit never shifts line numbers strictly above itself.
+
+    Only ever called from ``parse_and_validate_patches``, after individual
+    per-patch validation and before the result becomes ``proposed_patches``
+    -- ``edit_node``/``apply_patch``/``validate_patch`` are unchanged and
+    remain unaware this filtering happened.
+    """
+    files_in_order: List[str] = []
+    by_file: Dict[str, List[Dict[str, Any]]] = {}
+    for patch in patches:
+        fpath = patch["file_path"]
+        if fpath not in by_file:
+            files_in_order.append(fpath)
+            by_file[fpath] = []
+        by_file[fpath].append(patch)
+
+    resolved: List[Dict[str, Any]] = []
+    for fpath in files_in_order:
+        group = by_file[fpath]
+        if len(group) == 1:
+            resolved.append(group[0])
+            continue
+
+        has_whole_file_replacement = any(p["start_line"] is None and p["end_line"] is None for p in group)
+        if has_whole_file_replacement:
+            for dropped in group[1:]:
+                logger.warning(
+                    f"Dropped conflicting patch for '{fpath}' "
+                    f"(start_line={dropped['start_line']}, end_line={dropped['end_line']}): "
+                    "a whole-file replacement was also proposed for this file this attempt, "
+                    "so no other patch to it can be safely applied."
+                )
+            resolved.append(group[0])
+            continue
+
+        kept: List[Dict[str, Any]] = []
+        for candidate in group:
+            c_start, c_end = candidate["start_line"], candidate["end_line"]
+            conflict = next(
+                (k for k in kept if c_start <= k["end_line"] and k["start_line"] <= c_end),
+                None,
+            )
+            if conflict is not None:
+                logger.warning(
+                    f"Dropped conflicting patch for '{fpath}' (start_line={c_start}, "
+                    f"end_line={c_end}): overlaps a previously kept patch for the same file "
+                    f"(start_line={conflict['start_line']}, end_line={conflict['end_line']})."
+                )
+                continue
+            kept.append(candidate)
+
+        kept.sort(key=lambda p: p["start_line"], reverse=True)
+        resolved.extend(kept)
+
+    return resolved
 
 
 # Markdown fence language per file extension for the patch-generation

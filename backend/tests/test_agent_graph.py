@@ -146,6 +146,117 @@ def test_parse_and_validate_patches_safe_parsing():
     assert res_mixed[0]["file_path"] == "valid.py"
 
 
+# ===========================================================================
+# Phase 6E: deterministic same-file patch conflict resolution.
+#
+# edit_node applies proposed_patches in list order, mutating the file on
+# disk after each apply_patch call -- but validate_patch checks every
+# patch's line range against the file's ON-DISK state at validation time,
+# before any patch this attempt has been applied. Two patches to the same
+# file with different ranges can otherwise silently corrupt the file (the
+# second patch's line numbers, computed against the pre-edit file, no
+# longer point at the right content once the first patch has shifted it).
+# parse_and_validate_patches now resolves this deterministically before
+# proposed_patches is ever set -- see
+# app.services.agent.graph._resolve_same_file_patch_conflicts.
+# ===========================================================================
+def test_parse_and_validate_patches_same_file_non_overlapping_survive_ordered_bottom_to_top():
+    """Two non-overlapping same-file patches must both survive, returned
+    descending by start_line so edit_node applies bottom-to-top -- an
+    earlier (higher-line-number) edit never invalidates a not-yet-applied
+    lower-line-number patch's line numbers."""
+    raw = json.dumps([
+        {"file_path": "a.py", "code": "top\n", "start_line": 2, "end_line": 3},
+        {"file_path": "a.py", "code": "bottom\n", "start_line": 8, "end_line": 9},
+    ])
+    res = parse_and_validate_patches(raw)
+    assert len(res) == 2
+    assert res[0]["start_line"] == 8
+    assert res[1]["start_line"] == 2
+
+
+def test_parse_and_validate_patches_same_file_overlapping_keeps_first_drops_later():
+    raw = json.dumps([
+        {"file_path": "a.py", "code": "first\n", "start_line": 5, "end_line": 10},
+        {"file_path": "a.py", "code": "second\n", "start_line": 8, "end_line": 12},
+    ])
+    res = parse_and_validate_patches(raw)
+    assert len(res) == 1
+    assert res[0]["code"] == "first\n"
+    assert res[0]["start_line"] == 5
+
+
+def test_parse_and_validate_patches_whole_file_plus_range_keeps_only_first():
+    raw = json.dumps([
+        {"file_path": "a.py", "code": "whole file content\n"},
+        {"file_path": "a.py", "code": "range patch\n", "start_line": 3, "end_line": 4},
+    ])
+    res = parse_and_validate_patches(raw)
+    assert len(res) == 1
+    assert res[0]["code"] == "whole file content\n"
+    assert res[0]["start_line"] is None
+
+    # "First" means first by original list order, regardless of which of
+    # the two is the whole-file replacement.
+    raw_reversed = json.dumps([
+        {"file_path": "b.py", "code": "range patch\n", "start_line": 3, "end_line": 4},
+        {"file_path": "b.py", "code": "whole file content\n"},
+    ])
+    res_reversed = parse_and_validate_patches(raw_reversed)
+    assert len(res_reversed) == 1
+    assert res_reversed[0]["code"] == "range patch\n"
+    assert res_reversed[0]["start_line"] == 3
+
+
+def test_parse_and_validate_patches_multiple_files_all_preserved_and_unreordered():
+    """Patches to different files must never be dropped and must retain
+    their original first-appearance file order."""
+    raw = json.dumps([
+        {"file_path": "a.py", "code": "a1\n", "start_line": 1, "end_line": 1},
+        {"file_path": "b.py", "code": "b1\n", "start_line": 5, "end_line": 5},
+        {"file_path": "c.py", "code": "c1\n", "start_line": 9, "end_line": 9},
+    ])
+    res = parse_and_validate_patches(raw)
+    assert [p["file_path"] for p in res] == ["a.py", "b.py", "c.py"]
+    assert [p["code"] for p in res] == ["a1\n", "b1\n", "c1\n"]
+
+
+def test_parse_and_validate_patches_single_patch_per_file_unchanged():
+    """Regression guard: the overwhelmingly common single-patch-per-file
+    case must be byte-identical to pre-Phase-6E behavior -- no reordering,
+    no dropping, no logging."""
+    raw = json.dumps([
+        {"file_path": "src/app.py", "code": "x = 1\n", "start_line": 1, "end_line": 2},
+        {"file_path": "src/other.py", "code": "y = 2\n"},
+    ])
+    with patch("app.services.agent.graph.logger") as mock_logger:
+        res = parse_and_validate_patches(raw)
+
+    assert res == [
+        {"file_path": "src/app.py", "code": "x = 1\n", "start_line": 1, "end_line": 2},
+        {"file_path": "src/other.py", "code": "y = 2\n", "start_line": None, "end_line": None},
+    ]
+    mock_logger.warning.assert_not_called()
+
+
+def test_parse_and_validate_patches_logs_warning_for_each_dropped_conflict():
+    """Every dropped patch must be logged with enough information (file
+    path and both patches' line ranges) to diagnose the conflict."""
+    raw = json.dumps([
+        {"file_path": "a.py", "code": "first\n", "start_line": 5, "end_line": 10},
+        {"file_path": "a.py", "code": "second\n", "start_line": 8, "end_line": 12},
+    ])
+    with patch("app.services.agent.graph.logger") as mock_logger:
+        res = parse_and_validate_patches(raw)
+
+    assert len(res) == 1
+    mock_logger.warning.assert_called_once()
+    warning_message = mock_logger.warning.call_args[0][0]
+    assert "a.py" in warning_message
+    assert "8" in warning_message and "12" in warning_message
+    assert "5" in warning_message and "10" in warning_message
+
+
 def test_plan_node_generates_patches_from_mocked_gemini():
     """Test plan_node calls Gemini and stores valid proposed_patches in state."""
     mock_response = MagicMock()
@@ -216,6 +327,67 @@ def test_edit_node_applies_proposed_patches():
         content = target_file.read_text(encoding="utf-8")
         assert "new line 2" in content
         assert "old line 2" not in content
+
+
+def test_edit_node_applies_same_file_patches_correctly_after_conflict_resolution():
+    """End-to-end proof the Phase 6E fix actually prevents corruption, not
+    just that both patches are "kept": one patch's replacement changes the
+    file's line count (a 1-line region becomes 3 lines), so applying the
+    patches in the WRONG order would shift the second patch's target lines
+    and corrupt the file. Routes raw Gemini-shaped JSON through
+    parse_and_validate_patches (which reorders same-file patches
+    descending by start_line) and then through edit_node against a real
+    temporary file, asserting the ACTUAL final file content is correct."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        workspace = Path(tmpdir)
+        target_file = workspace / "sample.py"
+        target_file.write_text(
+            "line 1\nold line 2\nline 3\nline 4\nline 5\nline 6\nold line 7\nline 8\n",
+            encoding="utf-8",
+        )
+
+        # Emitted in top-to-bottom order, as an LLM naturally would --
+        # applying them in THIS order would corrupt the file once the
+        # first (line-count-changing) patch shifts everything below it.
+        raw = json.dumps([
+            {
+                "file_path": "sample.py",
+                "code": "fixed 2a\nfixed 2b\nfixed 2c\n",
+                "start_line": 2,
+                "end_line": 2,
+            },
+            {
+                "file_path": "sample.py",
+                "code": "fixed line 7\n",
+                "start_line": 7,
+                "end_line": 7,
+            },
+        ])
+        resolved_patches = parse_and_validate_patches(raw, workspace_dir=str(workspace))
+        # Reordered descending by start_line -- the line-7 patch applies
+        # first, against the still-untouched file.
+        assert [p["start_line"] for p in resolved_patches] == [7, 2]
+
+        res = edit_node({
+            "workspace_dir": str(workspace),
+            "attempt_count": 0,
+            "proposed_patches": resolved_patches,
+        })
+        assert res["applied_patch_count"] == 2
+
+        lines = target_file.read_text(encoding="utf-8").splitlines()
+        assert lines == [
+            "line 1",
+            "fixed 2a",
+            "fixed 2b",
+            "fixed 2c",
+            "line 3",
+            "line 4",
+            "line 5",
+            "line 6",
+            "fixed line 7",
+            "line 8",
+        ]
 
 
 @pytest.mark.asyncio
