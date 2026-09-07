@@ -262,7 +262,7 @@ async def test_plan_node_calls_gemini_when_patch_plan_status_is_planned():
         )
 
         with patch("app.services.agent.graph._generate_patches_with_gemini", return_value=[]) as mock_gen:
-            plan_node(state)
+            await plan_node(state)
 
         mock_gen.assert_called_once()
         assert mock_gen.call_args.kwargs["patch_plan"] == _planned().to_dict()
@@ -287,7 +287,7 @@ async def test_plan_node_never_calls_gemini_when_patch_plan_status_is_not_planne
         )
 
         with patch("app.services.agent.graph._generate_patches_with_gemini") as mock_gen:
-            out = plan_node(state)
+            out = await plan_node(state)
 
         mock_gen.assert_not_called()
         assert out["proposed_patches"] == []
@@ -311,7 +311,7 @@ async def test_plan_node_never_reuses_stale_patches_when_gate_is_closed():
             patch_plan=None,
         )
 
-        out = plan_node(state)
+        out = await plan_node(state)
 
     assert out["proposed_patches"] == []
 
@@ -452,7 +452,7 @@ async def test_diagnosis_failed_never_reaches_gemini_for_planning_or_patch_gener
             **out,
         )
         with patch("app.services.agent.graph._generate_patches_with_gemini") as mock_gen:
-            plan_out = plan_node(plan_state)
+            plan_out = await plan_node(plan_state)
 
     mock_gen.assert_not_called()
     assert plan_out["proposed_patches"] == []

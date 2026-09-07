@@ -27,6 +27,7 @@ exactly like ``_generate_patches_with_gemini`` already does.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Dict, List, Optional, Set
 
 from google import genai
@@ -199,7 +200,14 @@ async def diagnose(
         prompt = _build_diagnosis_prompt(task_description, retrieved_context, error_analysis)
         try:
             client = genai.Client(api_key=settings.gemini_api_key)
-            response = client.models.generate_content(
+            # Phase 7: the google-genai SDK's generate_content is a
+            # synchronous, blocking network call -- offloaded to a worker
+            # thread (mirrors app.services.embeddings.gemini's existing use
+            # of asyncio.to_thread) so a slow Gemini response never blocks
+            # this process's single event loop, which also serves unrelated
+            # FastAPI requests while diagnose_node runs in the background.
+            response = await asyncio.to_thread(
+                client.models.generate_content,
                 model=settings.gemini_model_name,
                 contents=prompt,
                 config={"system_instruction": _DIAGNOSIS_SYSTEM_INSTRUCTION},

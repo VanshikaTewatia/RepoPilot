@@ -28,6 +28,7 @@ receive something unsafe by relying on this function alone.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Dict, List, Optional
 
 from google import genai
@@ -322,7 +323,12 @@ async def plan_reproduction(
 
     try:
         client = genai.Client(api_key=settings.gemini_api_key)
-        response = client.models.generate_content(
+        # Phase 7: offload the blocking SDK call to a worker thread -- see
+        # app.services.diagnosis.diagnoser.diagnose's identical comment for
+        # the full rationale (mirrors app.services.embeddings.gemini's
+        # existing asyncio.to_thread use).
+        response = await asyncio.to_thread(
+            client.models.generate_content,
             model=settings.gemini_model_name,
             contents=_build_planner_prompt(task_description, evidence),
             config={"system_instruction": _PLANNER_SYSTEM_INSTRUCTION},

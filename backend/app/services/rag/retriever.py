@@ -1,5 +1,6 @@
 """Code-aware semantic retrieval and RAG question answering."""
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 from sqlalchemy import select
@@ -173,7 +174,14 @@ class CodeRetriever:
         try:
             if settings.gemini_api_key:
                 client = genai.Client(api_key=settings.gemini_api_key)
-                response = client.models.generate_content(
+                # Phase 7: offload the blocking SDK call to a worker thread --
+                # this function is awaited directly from the legacy
+                # /api/v1/rag/ask route handler, so a real Gemini call here
+                # would otherwise freeze the entire FastAPI process. Mirrors
+                # app.services.embeddings.gemini's existing asyncio.to_thread
+                # use.
+                response = await asyncio.to_thread(
+                    client.models.generate_content,
                     model=settings.gemini_model_name,
                     contents=prompt,
                     config={"system_instruction": system_instruction},

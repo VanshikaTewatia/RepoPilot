@@ -294,12 +294,18 @@ def test_verify_dotnet_project_end_to_end():
 
 
 # ---------------------------------------------------------------------------
-# Python still routes through the existing, unmodified DockerTestRunner
+# Phase 7: Python now routes through the same generic _run_adapter path
+# every other ecosystem already uses (no more DockerTestRunner.run_tests()
+# special case in VerificationEngine.verify()).
 # ---------------------------------------------------------------------------
 def test_verify_python_project_delegates_to_existing_sandbox_and_preserves_behavior():
+    """A manifest-less Python project (detected via PythonAdapter's
+    test_*.py-glob fallback, same as before Phase 7) has no install step at
+    all -- adapter.install_command() returns None -- so this exercises pure
+    pytest execution with zero pip/network involvement, and must keep
+    passing exactly as it did through the old delegation."""
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)
-        _write(root, "pyproject.toml", "[project]\nname='x'\n")
         _write(root, "test_math.py", "def test_add(): assert 1 + 1 == 2\n")
 
         engine = VerificationEngine()
@@ -312,9 +318,114 @@ def test_verify_python_project_delegates_to_existing_sandbox_and_preserves_behav
         result = engine.verify(root)
 
         assert result["ecosystem"] == "python"
+        assert result["available"] is True
         assert result["success"] is True
         assert result["passed"] == 1
         assert result["failed"] == 0
+
+
+def test_verify_python_project_uses_python_adapter_docker_image():
+    """PythonAdapter.docker_image (the pre-baked repopilot-sandbox-python
+    image carrying pytest) must actually be what _run_adapter passes to
+    Docker for a Python project -- not settings.docker_sandbox_image, and
+    not a hardcoded literal in the engine."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        _write(root, "test_math.py", "def test_add(): assert 1 + 1 == 2\n")
+
+        engine = VerificationEngine()
+        with patch.object(type(engine._docker_runner), "is_docker_available", True), \
+             patch.object(engine, "_execute_in_docker", return_value=("2 passed", 0)) as mock_exec, \
+             _tool_available():
+            result = engine.verify(root)
+
+        assert result["success"] is True
+        from app.services.verification.adapters.python_adapter import PythonAdapter
+        assert mock_exec.call_args.args[1] == PythonAdapter.docker_image
+        assert mock_exec.call_args.args[1] != "python:3.11-slim"
+
+
+def test_verify_python_project_with_dependencies_installs_isolated_and_mounts_readonly():
+    """A dependency-bearing Python project: the isolated ('outside the
+    container') pip-install step must run BEFORE the container, its result
+    mounted read-only with PYTHONPATH set, and the container itself must
+    receive no install step (install_argv=None) of its own -- i.e. no
+    network is needed inside the network_mode="none" container at all."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        _write(root, "pyproject.toml", "[project]\nname='x'\ndependencies=[]\n")
+        _write(root, "test_math.py", "def test_add(): assert 1 + 1 == 2\n")
+
+        engine = VerificationEngine()
+        with patch.object(type(engine._docker_runner), "is_docker_available", True), \
+             patch(
+                 "app.services.verification.engine.subprocess.run",
+                 return_value=_fake_completed(0, stdout="Successfully installed x\n"),
+             ) as mock_run, \
+             patch.object(engine, "_execute_in_docker", return_value=("2 passed", 0)) as mock_exec:
+            result = engine.verify(root)
+
+        assert result["success"] is True
+        assert result["available"] is True
+
+        # The isolated install actually ran, via python -m pip --target.
+        install_cmd = mock_run.call_args.args[0]
+        assert "--target" in install_cmd
+        assert install_cmd[0] != "pip"  # sys.executable, never a bare "pip"
+
+        # The container call received install_argv=None (no in-container
+        # install/network step) plus the read-only mount + PYTHONPATH.
+        _, _, install_argv, _test_argv = mock_exec.call_args.args
+        assert install_argv is None
+        kwargs = mock_exec.call_args.kwargs
+        assert kwargs["extra_env"] == {"PYTHONPATH": "/repopilot-deps"}
+        (mount_path,) = kwargs["extra_volumes"].keys()
+        assert kwargs["extra_volumes"][mount_path]["mode"] == "ro"
+
+
+def test_verify_python_project_isolated_install_failure_is_unable_to_verify_not_failed():
+    """A failed isolated dependency install must classify as available=False
+    (an environment/setup failure) -- never as a generic test failure --
+    and the network-isolated container must never even be started."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        _write(root, "requirements.txt", "some-package-that-does-not-resolve==999.999\n")
+        _write(root, "test_math.py", "def test_add(): assert 1 + 1 == 2\n")
+
+        engine = VerificationEngine()
+        with patch.object(type(engine._docker_runner), "is_docker_available", True), \
+             patch(
+                 "app.services.verification.engine.subprocess.run",
+                 return_value=_fake_completed(1, stderr="ERROR: Could not find a version\n"),
+             ), \
+             patch.object(engine, "_execute_in_docker") as mock_exec:
+            result = engine.verify(root)
+
+        mock_exec.assert_not_called()
+        assert result["available"] is False
+        assert result["success"] is False
+        assert "not evidence that the reported issue does or does not exist" in result["detail"]
+        assert "Could not find a version" in result["output"]
+
+
+def test_verify_python_project_genuine_test_failure_is_still_available_true():
+    """A real pytest failure (no install involved -- manifest-less project)
+    must remain a genuine, retryable test failure: available=True,
+    success=False -- proving Phase 7's classification fix distinguishes a
+    real failure from an environment failure rather than conflating them."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        _write(root, "test_math.py", "def test_add(): assert 1 + 1 == 3\n")
+
+        engine = VerificationEngine()
+        engine._docker_runner._docker_checked = True
+        engine._docker_runner._docker_available = False
+        result = engine.verify(root)
+
+        assert result["ecosystem"] == "python"
+        assert result["available"] is True
+        assert result["success"] is False
+        assert result["failed"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +453,6 @@ def test_verify_repository_single_project_delegates_exactly_like_verify():
     verify() -- no wrapping, no behavior change for existing callers."""
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)
-        _write(root, "pyproject.toml", "[project]\nname='x'\n")
         _write(root, "test_math.py", "def test_add(): assert 1 + 1 == 2\n")
 
         engine = VerificationEngine()

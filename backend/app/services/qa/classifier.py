@@ -16,6 +16,7 @@ later verify (or correct) against real repository evidence -- this module
 never validates it, never uses it to decide what actually exists.
 """
 
+import asyncio
 from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
@@ -212,7 +213,14 @@ async def classify_question(question: str) -> QuestionClass:
 
     try:
         client = genai.Client(api_key=settings.gemini_api_key)
-        response = client.models.generate_content(
+        # Phase 7: offload the blocking SDK call to a worker thread. This
+        # function is awaited directly from the /api/v1/qa/ask route handler
+        # (not the agent graph) -- without this, a real Gemini call here
+        # would freeze the entire FastAPI process for every other in-flight
+        # request too, not just this one. Mirrors
+        # app.services.embeddings.gemini's existing asyncio.to_thread use.
+        response = await asyncio.to_thread(
+            client.models.generate_content,
             model=settings.gemini_model_name,
             contents=_build_classifier_prompt(question),
             config={"system_instruction": _CLASSIFIER_SYSTEM_INSTRUCTION},

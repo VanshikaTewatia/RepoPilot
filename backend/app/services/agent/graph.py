@@ -1,5 +1,6 @@
 """LangGraph multi-step reasoning agent with iterative self-correction."""
 
+import asyncio
 import json
 import os
 import re
@@ -940,7 +941,7 @@ async def patch_plan_node(state: AgentState) -> Dict[str, Any]:
     }
 
 
-def plan_node(state: AgentState) -> Dict[str, Any]:
+async def plan_node(state: AgentState) -> Dict[str, Any]:
     """Generate repair plan and structured proposed patches based on fresh context.
 
     Phase 6C: Gemini patch generation is now gated behind an ALLOW-LIST
@@ -953,6 +954,13 @@ def plan_node(state: AgentState) -> Dict[str, Any]:
     denylist of known-bad statuses) so no current or future status can
     accidentally fall through to patch generation. See
     app.services.patch_plan's package docstring for the full rationale.
+
+    Phase 7: now ``async def`` (was a plain ``def``) purely so the Gemini
+    patch-generation call below can be offloaded via ``asyncio.to_thread``
+    -- LangGraph already runs a mix of sync/async nodes in this exact graph,
+    so this is not a topology change. ``_generate_patches_with_gemini``
+    itself is deliberately left as a plain, synchronous, directly
+    unit-testable function; only this call site changes.
     """
     desc = state["task_description"]
     workspace = state.get("workspace_dir", "")
@@ -976,7 +984,8 @@ def plan_node(state: AgentState) -> Dict[str, Any]:
             fresh_retrieved.append(item)
 
     if patch_plan_status == PatchPlanStatus.PLANNED.value:
-        patches = _generate_patches_with_gemini(
+        patches = await asyncio.to_thread(
+            _generate_patches_with_gemini,
             task_description=desc,
             retrieved_context=fresh_retrieved,
             error_analysis=error_analysis,
@@ -1130,9 +1139,29 @@ def analyze_failure_node(state: AgentState) -> Dict[str, Any]:
 
 
 def should_continue(state: AgentState) -> str:
-    """Route based on verification result and retry budget."""
+    """Route based on verification result and retry budget.
+
+    Phase 7: a confirmed environment/tooling failure (``test_results
+    ["available"] is False`` -- verification tooling could not actually run,
+    e.g. a missing toolchain or a failed dependency install; see
+    ``VerificationEngine``) is never retried, regardless of remaining
+    attempt budget. Retrying would re-run the exact same broken environment
+    and fail identically every time -- it can never turn an environment
+    failure into a genuine result, only waste attempts and Gemini calls.
+    Routes to the same "failed" edge (-> finalize) an exhausted retry budget
+    already uses; finalize_node's existing, unchanged
+    ``if not test_res.get("available", True): outcome = "UNABLE_TO_VERIFY"``
+    check is what turns this into the correct outcome, not this function.
+
+    A genuine test failure (``available`` True, ``success`` False) is
+    completely unaffected -- it still retries up to ``max_attempts`` exactly
+    as before.
+    """
     if state.get("is_verified", False):
         return "human_approval"
+    test_res = state.get("test_results") or {}
+    if not test_res.get("available", True):
+        return "failed"
     if state.get("attempt_count", 0) < state.get("max_attempts", 3):
         return "analyze_failure"
     return "failed"

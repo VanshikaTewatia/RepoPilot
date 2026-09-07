@@ -15,13 +15,15 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.config import settings
 from app.core.logging import logger
-from app.services.sandbox.docker_runner import DockerTestRunner
+from app.services.sandbox.docker_runner import DockerTestRunner, _detect_dependency_install_args
 from app.services.verification.base import VerificationAdapter, VerificationResult
 from app.services.verification.detector import ProjectDetector
 from app.services.verification.project_analyzer import RepositoryAnalyzer, select_relevant_projects
@@ -267,16 +269,18 @@ class VerificationEngine:
 
         adapter = detection.adapter
 
-        if adapter.ecosystem == "python":
-            # Preserve the exact, already-hardened Python/pytest execution path.
-            result = self._docker_runner.run_tests(workspace_path=workspace, test_path=test_path)
-            result.setdefault("ecosystem", "python")
-            result.setdefault("available", True)
-            result.setdefault("manifests_found", detection.manifests_found)
-            result.setdefault("detail", None)
-            result.setdefault("command", None)
-            return result
-
+        # Phase 7: Python is no longer special-cased to the legacy
+        # DockerTestRunner.run_tests() delegation -- that path predates (and
+        # never applied) the install-failure/toolchain-missing classification
+        # _run_adapter already provides for every other ecosystem, so a
+        # Python dependency-install failure under network_mode="none" was
+        # never distinguishable from a genuine test failure (always
+        # available=True). Routing Python through the same _run_adapter path
+        # every other ecosystem already uses fixes that classification for
+        # free -- see PythonAdapter.docker_image (a pre-baked image carrying
+        # pytest) and _run_adapter's Python-specific host-side dependency
+        # install below for what makes verification actually able to run,
+        # not just fail honestly.
         return self._run_adapter(adapter, workspace, test_path, detection.manifests_found)
 
     # -------------------------------------------------------------------
@@ -394,12 +398,83 @@ class VerificationEngine:
         install_argv = adapter.install_command(workspace)
         _ensure_wrapper_executable(workspace, test_argv[0])
 
-        if self._docker_runner.is_docker_available:
-            output, exit_code = self._execute_in_docker(
-                workspace, adapter.docker_image, install_argv, test_argv
-            )
-        else:
-            output, exit_code = self._execute_in_subprocess(workspace, install_argv, test_argv)
+        # Phase 7: for Python specifically, resolve the target repository's
+        # OWN dependencies (never the harness's own tooling -- pytest itself
+        # is pre-baked into PythonAdapter.docker_image, see the Dockerfile
+        # under docker/sandbox/python/) into an ISOLATED directory, outside
+        # both the network-isolated Docker container and RepoPilot's own
+        # live Python environment, then expose the result via PYTHONPATH.
+        # Mirrors DockerTestRunner._install_dependencies's existing
+        # "install outside, mount inside" pattern (used today only by the
+        # legacy Python subprocess fallback) -- applied here to BOTH
+        # execution paths below, Docker (read-only bind mount) and
+        # subprocess (PYTHONPATH env var only, same isolated directory),
+        # so neither path ever runs a bare `pip install .` directly against
+        # a network-isolated container (impossible) or directly into this
+        # backend process's own environment (unsafe) -- both were real
+        # risks of naively routing Python through the fully-generic
+        # execution helpers below unchanged. Only Python gets this
+        # treatment; every other ecosystem's install/test flow is
+        # completely unchanged.
+        host_deps_dir: Optional[str] = None
+        extra_volumes: Optional[Dict[str, Dict[str, str]]] = None
+        extra_env: Optional[Dict[str, str]] = None
+
+        if adapter.ecosystem == "python" and install_argv:
+            py_install_args = _detect_dependency_install_args(workspace)
+            if py_install_args:
+                host_deps_dir, host_install_log = self._install_python_deps_isolated(
+                    workspace, py_install_args
+                )
+                if host_deps_dir is None:
+                    duration = time.time() - start_time
+                    detail = (
+                        "Project dependencies could not be installed ahead of verification "
+                        "(the isolated pip install failed), so Python verification could not "
+                        "be run. This is not evidence that the reported issue does or does not "
+                        "exist."
+                    )
+                    logger.warning(
+                        f"Isolated Python dependency installation failed at {workspace}: {detail}"
+                    )
+                    return VerificationResult(
+                        ecosystem=adapter.ecosystem,
+                        success=False,
+                        exit_code=1,
+                        output=host_install_log,
+                        passed=0,
+                        failed=0,
+                        duration=round(duration, 2),
+                        available=False,
+                        manifests_found=manifests_found,
+                        detail=detail,
+                        command=" ".join(test_argv),
+                    ).to_dict()
+                extra_volumes = {host_deps_dir: {"bind": "/repopilot-deps", "mode": "ro"}}
+                extra_env = {"PYTHONPATH": "/repopilot-deps"}
+                # Already installed in isolation -- neither execution path
+                # below needs its own install step (Docker: no network
+                # needed either; subprocess: never touches this process's
+                # own environment).
+                install_argv = None
+
+        try:
+            if self._docker_runner.is_docker_available:
+                output, exit_code = self._execute_in_docker(
+                    workspace,
+                    adapter.docker_image,
+                    install_argv,
+                    test_argv,
+                    extra_volumes=extra_volumes,
+                    extra_env=extra_env,
+                )
+            else:
+                output, exit_code = self._execute_in_subprocess(
+                    workspace, install_argv, test_argv, extra_env=extra_env
+                )
+        finally:
+            if host_deps_dir:
+                shutil.rmtree(host_deps_dir, ignore_errors=True)
 
         duration = time.time() - start_time
 
@@ -478,6 +553,8 @@ class VerificationEngine:
         install_argv: Optional[List[str]],
         test_argv: List[str],
         timeout: Optional[int] = None,
+        extra_volumes: Optional[Dict[str, Dict[str, str]]] = None,
+        extra_env: Optional[Dict[str, str]] = None,
     ) -> Tuple[str, int]:
         """Run install + test commands in an ephemeral Docker container.
 
@@ -513,6 +590,13 @@ class VerificationEngine:
         rather than blocking indefinitely. Passed through explicitly rather
         than mutating ``self.timeout`` so concurrent calls on the same
         engine instance can never leak a custom timeout into one another.
+
+        ``extra_volumes``/``extra_env`` (Phase 7): additional read-only host
+        mounts and environment variables for this one run only, used by
+        ``_run_adapter`` to give Python verification its host-side-installed
+        dependencies via a read-only mount and ``PYTHONPATH`` -- both
+        default to ``None``, identical to omitting them, so no other
+        ecosystem's call is affected.
         """
         effective_timeout = timeout if timeout is not None else self.timeout
         script_parts = [_preflight_snippet(test_argv[0])]
@@ -530,14 +614,21 @@ class VerificationEngine:
         script = "; ".join(script_parts)
         cmd = ["sh", "-c", script, "sh"] + test_argv
 
+        volumes = {str(workspace): {"bind": "/workspace", "mode": "rw"}}
+        if extra_volumes:
+            volumes.update(extra_volumes)
+        environment = dict(_CONTAINER_ENV)
+        if extra_env:
+            environment.update(extra_env)
+
         container = None
         try:
             container = self._docker_runner._docker_client.containers.run(
                 image=image,
                 command=cmd,
                 working_dir="/workspace",
-                volumes={str(workspace): {"bind": "/workspace", "mode": "rw"}},
-                environment=_CONTAINER_ENV,
+                volumes=volumes,
+                environment=environment,
                 network_mode=self.network_mode,
                 nano_cpus=int(settings.sandbox_max_cpu * 1e9),
                 mem_limit=f"{settings.sandbox_max_memory_mb}m",
@@ -578,12 +669,70 @@ class VerificationEngine:
                 except (DockerException, APIError):
                     pass
 
+    def _install_python_deps_isolated(
+        self, workspace: Path, install_args: List[str]
+    ) -> Tuple[Optional[str], str]:
+        """Best-effort ``pip install --target`` for a Python project's OWN
+        declared dependencies, run into a fresh, isolated directory --
+        never the network-isolated verification container, and never
+        RepoPilot's own live Python environment (Phase 7).
+
+        Mirrors ``DockerTestRunner._install_dependencies`` -- the same
+        "install outside, mount inside" pattern already used today by the
+        legacy Python subprocess fallback -- generalized here for
+        ``_run_adapter`` so BOTH the Docker path (read-only bind mount) and
+        the subprocess path (``PYTHONPATH`` only) can verify a Python
+        project with real third-party dependencies without either a
+        ``network_mode="none"`` container needing network access, or a bare
+        ``pip install .`` landing directly in this backend process's own
+        environment. Installs into a fresh, per-call temp directory (never
+        shared across calls); the caller is responsible for removing it
+        once the run it served has finished.
+
+        Returns ``(target_dir, log)``. ``target_dir`` is ``None`` when the
+        install itself failed or errored -- the caller treats that as an
+        environment/setup failure (``available=False``), never as a masked
+        test failure: retrying the identical install (in a container with
+        no network, or against the same unresolvable requirement) would
+        fail identically, so there is no "maybe it'll work anyway" fallback
+        to attempt.
+        """
+        target_dir = tempfile.mkdtemp(prefix="repopilot_pydeps_")
+        cmd = [
+            sys.executable, "-m", "pip", "install",
+            "--quiet", "--disable-pip-version-check", "--no-input",
+            "--target", target_dir,
+        ] + install_args
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=workspace,
+                capture_output=True,
+                text=True,
+                timeout=min(self.timeout, _INSTALL_TIMEOUT_SECONDS) if self.timeout else _INSTALL_TIMEOUT_SECONDS,
+            )
+            log = (
+                f"$ pip install --target <isolated dir> {' '.join(install_args)}\n"
+                f"{result.stdout}\n{result.stderr}"
+            ).strip()
+            if result.returncode != 0:
+                shutil.rmtree(target_dir, ignore_errors=True)
+                return None, log
+            return target_dir, log
+        except subprocess.TimeoutExpired:
+            shutil.rmtree(target_dir, ignore_errors=True)
+            return None, f"Host-side dependency installation timed out after {_INSTALL_TIMEOUT_SECONDS}s."
+        except Exception as e:
+            shutil.rmtree(target_dir, ignore_errors=True)
+            return None, f"Host-side dependency installation error: {e}"
+
     def _execute_in_subprocess(
         self,
         workspace: Path,
         install_argv: Optional[List[str]],
         test_argv: List[str],
         timeout: Optional[int] = None,
+        extra_env: Optional[Dict[str, str]] = None,
     ) -> Tuple[str, int]:
         """Run install (best-effort) + test commands as local subprocesses, cwd=workspace.
 
@@ -603,6 +752,12 @@ class VerificationEngine:
         present from a prior install even if this particular install command
         failed, so a hard "dependencies unavailable" verdict isn't
         warranted.
+
+        ``extra_env`` (Phase 7): additional environment variables for the
+        TEST command only (e.g. ``PYTHONPATH`` pointing at
+        ``_install_python_deps_isolated``'s isolated install directory) --
+        defaults to ``None``, identical to omitting it, so no other
+        ecosystem's call is affected.
         """
         effective_timeout = timeout if timeout is not None else self.timeout
         if not _tool_is_available(test_argv[0], workspace):
@@ -633,6 +788,11 @@ class VerificationEngine:
             except Exception as e:
                 install_log = f"Dependency installation error: {e}"
 
+        env = None
+        if extra_env:
+            env = os.environ.copy()
+            env.update(extra_env)
+
         try:
             result = subprocess.run(
                 test_argv,
@@ -640,6 +800,7 @@ class VerificationEngine:
                 capture_output=True,
                 text=True,
                 timeout=effective_timeout,
+                env=env,
             )
             combined = f"{install_log}\n\n{result.stdout}\n{result.stderr}".strip()
             return combined, result.returncode

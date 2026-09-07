@@ -12,6 +12,7 @@ from app.services.agent.graph import (
     edit_node,
     investigate_node,
     retrieve_node,
+    should_continue,
     validate_patch,
     parse_and_validate_patches,
     _generate_patches_with_gemini,
@@ -257,7 +258,7 @@ def test_parse_and_validate_patches_logs_warning_for_each_dropped_conflict():
     assert "5" in warning_message and "10" in warning_message
 
 
-def test_plan_node_generates_patches_from_mocked_gemini():
+async def test_plan_node_generates_patches_from_mocked_gemini():
     """Test plan_node calls Gemini and stores valid proposed_patches in state."""
     mock_response = MagicMock()
     mock_response.text = json.dumps([
@@ -289,7 +290,7 @@ def test_plan_node_generates_patches_from_mocked_gemini():
 
     with patch("app.core.config.settings.gemini_api_key", "real_like_test_key_12345"):
         with patch("google.genai.Client", return_value=mock_client):
-            out = plan_node(state)
+            out = await plan_node(state)
 
     assert out["status"] == "planning"
     assert len(out["proposed_patches"]) == 1
@@ -853,3 +854,135 @@ def test_patch_prompt_fence_language_covers_multiple_ecosystems_and_unknown_fall
     # No mapping entry for an extensionless file -- safe generic fallback,
     # never the raw (attacker-influenced) filename/extension text itself.
     assert "### File: Makefile (2 lines total)\n```text\n" in prompt
+
+
+# ===========================================================================
+# Phase 7: should_continue -- a confirmed environment/tooling failure must
+# never burn the retry budget; a genuine test failure must retry exactly as
+# before.
+# ===========================================================================
+def test_should_continue_stops_immediately_on_environment_failure_even_on_first_attempt():
+    """available=False (verification tooling could not run) must route
+    straight to "failed" (-> finalize) regardless of remaining attempt
+    budget -- retrying would re-hit the identical broken environment."""
+    state = {
+        "is_verified": False,
+        "attempt_count": 1,
+        "max_attempts": 3,
+        "test_results": {"available": False, "success": False},
+    }
+    assert should_continue(state) == "failed"
+
+
+def test_should_continue_stops_on_environment_failure_before_any_attempt_used():
+    """Even on attempt_count == 0 (nothing retried yet), an environment
+    failure must not consume any of the retry budget."""
+    state = {
+        "is_verified": False,
+        "attempt_count": 0,
+        "max_attempts": 3,
+        "test_results": {"available": False},
+    }
+    assert should_continue(state) == "failed"
+
+
+def test_should_continue_still_retries_a_genuine_test_failure():
+    """available=True, success=False (a real, in-suite test failure) must
+    retain the existing retry behavior -- completely unaffected by the
+    Phase 7 environment-failure short-circuit."""
+    state = {
+        "is_verified": False,
+        "attempt_count": 1,
+        "max_attempts": 3,
+        "test_results": {"available": True, "success": False, "failed": 1},
+    }
+    assert should_continue(state) == "analyze_failure"
+
+
+def test_should_continue_still_exhausts_retry_budget_for_genuine_failures():
+    """A genuine, repeatedly-failing test must still exhaust max_attempts
+    exactly as before Phase 7."""
+    state = {
+        "is_verified": False,
+        "attempt_count": 3,
+        "max_attempts": 3,
+        "test_results": {"available": True, "success": False, "failed": 1},
+    }
+    assert should_continue(state) == "failed"
+
+
+def test_should_continue_missing_test_results_defaults_available_true():
+    """No test_results at all (e.g. a hand-constructed state, or a node
+    that never reached test execution) must default to the pre-Phase-7
+    behavior -- available implicitly True -- never mistaken for a confirmed
+    environment failure."""
+    state = {"is_verified": False, "attempt_count": 0, "max_attempts": 3}
+    assert should_continue(state) == "analyze_failure"
+
+
+def test_should_continue_is_verified_wins_over_everything_else():
+    """is_verified=True must still route to human_approval even if
+    test_results somehow also carries available=False -- verification
+    success is checked first, unchanged from before Phase 7."""
+    state = {
+        "is_verified": True,
+        "attempt_count": 1,
+        "max_attempts": 3,
+        "test_results": {"available": False},
+    }
+    assert should_continue(state) == "human_approval"
+
+
+# ===========================================================================
+# Phase 7: a real Gemini call from an async node must not block unrelated
+# asyncio work on the same event loop -- proven with a synchronous,
+# blocking stand-in for the SDK call (proves the asyncio.to_thread
+# mechanism itself; the live, real-Gemini version of this proof is a
+# separate, non-mocked acceptance test, not a unit test).
+# ===========================================================================
+@pytest.mark.asyncio
+async def test_plan_node_gemini_call_does_not_block_the_event_loop():
+    import asyncio
+    import time
+
+    mock_response = MagicMock()
+    mock_response.text = json.dumps([])
+
+    def blocking_generate_content(*args, **kwargs):
+        # Stands in for the real (synchronous, blocking) SDK call --
+        # if plan_node's Gemini call were NOT offloaded via
+        # asyncio.to_thread, this sleep would freeze the whole event loop
+        # for its duration, and `other_task` below would only run
+        # afterwards instead of concurrently.
+        time.sleep(0.3)
+        return mock_response
+
+    mock_client = MagicMock()
+    mock_client.models.generate_content.side_effect = blocking_generate_content
+
+    state = {
+        "workspace_dir": "/tmp/test_ws",
+        "task_description": "Fix VIP discount calculation",
+        "retrieved_context": [
+            {"file_path": "src/order_service.py", "content": "pass", "total_lines": 1}
+        ],
+        "error_analysis": None,
+        "patch_plan_status": "PLANNED",
+        "patch_plan": None,
+    }
+
+    other_task_ran_at = {}
+
+    async def other_task():
+        await asyncio.sleep(0.05)
+        other_task_ran_at["t"] = time.monotonic()
+
+    with patch("app.core.config.settings.gemini_api_key", "real_like_test_key_12345"):
+        with patch("google.genai.Client", return_value=mock_client):
+            start = time.monotonic()
+            _, _ = await asyncio.gather(plan_node(state), other_task())
+
+    # other_task only sleeps 0.05s -- if the event loop were free, it
+    # finishes long before plan_node's 0.3s blocking call does. A frozen
+    # event loop would instead delay it until at least ~0.3s.
+    assert other_task_ran_at["t"] - start < 0.2

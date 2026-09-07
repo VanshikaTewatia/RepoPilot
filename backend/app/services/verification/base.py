@@ -66,12 +66,10 @@ class VerificationAdapter(ABC):
     # find_manifests()/detect() instead of relying on this list alone.
     manifest_files: ClassVar[List[str]] = []
     # Docker image that actually contains this ecosystem's toolchain. Every
-    # non-Python ecosystem is executed in its own adapter-declared image
-    # rather than a single shared image, so adding a new ecosystem never
-    # requires touching the engine's execution code -- only this class
-    # attribute and the command/parsing methods below. (Python keeps using
-    # ``settings.docker_sandbox_image`` via the pre-existing DockerTestRunner
-    # delegation in VerificationEngine.verify(), so it never reads this.)
+    # ecosystem (Python included, as of Phase 7) is executed in its own
+    # adapter-declared image rather than a single shared image, so adding a
+    # new ecosystem never requires touching the engine's execution code --
+    # only this class attribute and the command/parsing methods below.
     docker_image: ClassVar[str] = "python:3.11-slim"
 
     @classmethod

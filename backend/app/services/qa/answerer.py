@@ -26,6 +26,7 @@ Never fabricates:
     if it were a confident architectural fact.
 """
 
+import asyncio
 from typing import List, Set
 
 from google import genai
@@ -234,7 +235,14 @@ async def generate_answer(
         prompt = _build_answer_prompt(question, question_class, evidence_list)
         try:
             client = genai.Client(api_key=settings.gemini_api_key)
-            response = client.models.generate_content(
+            # Phase 7: offload the blocking SDK call to a worker thread --
+            # this function is awaited directly from the /api/v1/qa/ask
+            # route handler, so without this a real Gemini call here would
+            # freeze the entire FastAPI process. See
+            # app.services.qa.classifier.classify_question's identical
+            # comment.
+            response = await asyncio.to_thread(
+                client.models.generate_content,
                 model=settings.gemini_model_name,
                 contents=prompt,
                 config={"system_instruction": _ANSWER_SYSTEM_INSTRUCTION},

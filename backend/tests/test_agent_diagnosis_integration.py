@@ -234,7 +234,7 @@ async def test_plan_node_passes_diagnosis_through_to_patch_generation():
         )
 
         with patch("app.services.agent.graph._generate_patches_with_gemini", return_value=[]) as mock_gen:
-            plan_node(state)
+            await plan_node(state)
 
         assert mock_gen.call_args.kwargs["diagnosis"] == _diagnosed().to_dict()
 

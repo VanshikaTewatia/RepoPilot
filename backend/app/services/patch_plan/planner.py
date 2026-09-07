@@ -28,6 +28,7 @@ itself a diff, never passed to edit_node/apply_patch.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Dict, List, Optional, Set
 
 from google import genai
@@ -255,7 +256,13 @@ async def plan_patches(
         prompt = _build_patch_plan_prompt(task_description, retrieved_context, diagnosis, error_analysis)
         try:
             client = genai.Client(api_key=settings.gemini_api_key)
-            response = client.models.generate_content(
+            # Phase 7: offload the blocking SDK call to a worker thread --
+            # see app.services.diagnosis.diagnoser.diagnose's identical
+            # comment for the full rationale (mirrors
+            # app.services.embeddings.gemini's existing asyncio.to_thread
+            # use).
+            response = await asyncio.to_thread(
+                client.models.generate_content,
                 model=settings.gemini_model_name,
                 contents=prompt,
                 config={"system_instruction": _PATCH_PLAN_SYSTEM_INSTRUCTION},

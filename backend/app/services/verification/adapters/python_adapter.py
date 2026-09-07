@@ -1,12 +1,16 @@
 """Python verification adapter.
 
-Command construction here mirrors ``app.services.sandbox.docker_runner``
-exactly (``pip install -r requirements.txt`` / ``pip install .`` then
-``pytest``), purely so command *selection* is documented and unit-testable
-like every other ecosystem. Actual execution for a detected Python project is
-delegated wholesale to the existing, already-hardened ``DockerTestRunner``
-(see ``VerificationEngine.verify``) so demo_repo and all pre-existing sandbox
-behavior are preserved byte-for-byte.
+Phase 7: executed through the same generic ``VerificationEngine._run_adapter``
+path every other ecosystem already uses (no more Python-specific bypass in
+``VerificationEngine.verify``), so a failed dependency install is classified
+exactly like it is for Node/Go/etc -- ``available=False``, never a misleading
+generic test failure. ``docker_image`` points at a pre-baked image carrying
+``pytest`` (see ``docker/sandbox/python/Dockerfile``) since the stock
+``python:3.11-slim`` ships no test framework and installing one at
+verification-run time would need network the sandbox correctly denies. A
+target repository's OWN third-party dependencies are handled separately, by
+``VerificationEngine._install_python_deps_for_docker`` (host-side install,
+mounted read-only) -- never by this adapter or this image.
 """
 
 import re
@@ -19,6 +23,10 @@ from app.services.verification.base import VerificationAdapter
 class PythonAdapter(VerificationAdapter):
     ecosystem: ClassVar[str] = "python"
     manifest_files: ClassVar[List[str]] = ["pyproject.toml", "requirements.txt", "setup.py"]
+    # Built ahead of time via `docker build -t repopilot-sandbox-python:3.11
+    # docker/sandbox/python` -- see that Dockerfile for why pytest can't just
+    # be installed at verification-run time.
+    docker_image: ClassVar[str] = "repopilot-sandbox-python:3.11"
 
     @classmethod
     def detect(cls, workspace: Path) -> bool:

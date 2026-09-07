@@ -143,8 +143,15 @@ class Settings(BaseSettings):
         description="Filesystem root path for cloned repositories and task workspaces",
     )
     docker_sandbox_image: str = Field(
-        default="python:3.11-slim",
-        description="Base Docker image used for sandbox test execution",
+        default="repopilot-sandbox-python:3.11",
+        description=(
+            "Fallback Docker image for sandbox command execution that doesn't "
+            "specify its own image (e.g. baseline reproduction commands with "
+            "no adapter-declared image). PythonAdapter.docker_image is what "
+            "Python verification itself actually uses -- see "
+            "docker/sandbox/python/Dockerfile. Build once: `docker build -t "
+            "repopilot-sandbox-python:3.11 docker/sandbox/python`."
+        ),
     )
     sandbox_timeout_seconds: int = Field(
         default=45,
