@@ -71,6 +71,7 @@ def _make_db(
     db.execute = AsyncMock(side_effect=execute)
     db.add = MagicMock()
     db.commit = AsyncMock()
+    db.rollback = AsyncMock()
     db.refresh = AsyncMock(side_effect=refresh)
     return db
 
@@ -345,3 +346,132 @@ async def test_get_task_remains_responsive_during_background_execution(tmp_path)
         await bg  # let the background task finish cleanly before teardown
 
     assert task.status == "no_change_needed"
+
+
+# ===========================================================================
+# 7. SESSION RECOVERY (Phase 6G): a transient commit failure inside
+# _persist_task_status must not poison the shared session for the rest of
+# the run -- rollback() recovers it so later intermediate writes and the
+# final outcome commit still succeed.
+# ===========================================================================
+@pytest.mark.asyncio
+async def test_persist_task_status_recovers_from_transient_commit_failure(tmp_path):
+    task = Task(id=21, repository_id=1, title="t", description="d", status="investigating")
+    background_db = _make_db(task=task)
+
+    committed_statuses: List[str] = []
+    calls = {"n": 0}
+
+    async def flaky_commit():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient db error")
+        committed_statuses.append(task.status)
+
+    background_db.commit = AsyncMock(side_effect=flaky_commit)
+    session_local = MagicMock(return_value=_make_session_cm(background_db))
+
+    steps = [
+        {"investigate": {"status": "investigating"}},  # no-op: already the current status
+        {"retrieve": {"status": "retrieved", "retrieved_context": []}},  # commit #1 -> raises
+        {"plan": {"status": "planning", "repair_plan": "p", "proposed_patches": []}},  # commit #2 -> succeeds
+        {"finalize": {"outcome": "NO_CHANGE_NEEDED", "outcome_detail": "already correct"}},
+    ]
+    manager_cls = _make_workspace_manager(tmp_path)
+
+    with patch.object(agent_module, "AsyncSessionLocal", session_local), patch.object(
+        agent_module, "WorkspaceManager", manager_cls
+    ), patch.object(agent_module.agent_app, "astream", MagicMock(side_effect=_fake_astream_factory(steps))):
+        await _run_agent_task(
+            task_id=21,
+            workspace=tmp_path,
+            task_description="d",
+            test_target=None,
+            max_attempts=3,
+            repository_id=1,
+        )
+
+    # The "retrieved" write's commit failed transiently; rollback() was
+    # called (recovering the session) so "planning" and the final outcome
+    # commit both went through afterward -- neither raised
+    # PendingRollbackError, and the run reached its real, correct outcome.
+    background_db.rollback.assert_called()
+    assert committed_statuses == ["planning", "no_change_needed"]
+    assert task.status == "no_change_needed"
+
+
+# ===========================================================================
+# 8. SESSION RECOVERY (Phase 6G): when the FINAL outcome commit itself
+# fails transiently, the outer except's own rollback() must recover the
+# session so the failure-status write actually lands, instead of raising
+# PendingRollbackError and being silently swallowed (which would leave the
+# task stuck at its last intermediate status forever).
+# ===========================================================================
+@pytest.mark.asyncio
+async def test_run_agent_task_recovers_via_rollback_when_final_commit_fails(tmp_path):
+    task = Task(id=22, repository_id=1, title="t", description="d", status="investigating")
+    background_db = _make_db(task=task)
+
+    commit_calls = {"n": 0}
+
+    async def flaky_commit():
+        commit_calls["n"] += 1
+        if commit_calls["n"] == 1:
+            raise RuntimeError("final commit failed")
+
+    background_db.commit = AsyncMock(side_effect=flaky_commit)
+    session_local = MagicMock(return_value=_make_session_cm(background_db))
+
+    steps = [{"finalize": {"outcome": "NO_CHANGE_NEEDED", "outcome_detail": "already correct"}}]
+    manager_cls = _make_workspace_manager(tmp_path)
+
+    with patch.object(agent_module, "AsyncSessionLocal", session_local), patch.object(
+        agent_module, "WorkspaceManager", manager_cls
+    ), patch.object(agent_module.agent_app, "astream", MagicMock(side_effect=_fake_astream_factory(steps))):
+        # Must not raise -- and must not leave the task without a terminal
+        # status just because the first commit attempt failed.
+        await _run_agent_task(
+            task_id=22,
+            workspace=tmp_path,
+            task_description="d",
+            test_target=None,
+            max_attempts=3,
+            repository_id=1,
+        )
+
+    background_db.rollback.assert_called()
+    assert task.status == "failed"
+    assert "final commit failed" in task.test_output
+
+
+# ===========================================================================
+# 9. OUTCOME INTEGRITY (Phase 6G): a workspace-cleanup failure in the
+# non-FIXED success path (e.g. a locked file on Windows) must never
+# overwrite the already-computed, correct outcome with a generic "failed"
+# status -- cleanup there is best-effort only.
+# ===========================================================================
+@pytest.mark.asyncio
+async def test_cleanup_failure_does_not_mask_correct_outcome(tmp_path):
+    task = Task(id=23, repository_id=1, title="t", description="d", status="investigating")
+    background_db = _make_db(task=task)
+    session_local = MagicMock(return_value=_make_session_cm(background_db))
+
+    manager_cls = _make_workspace_manager(tmp_path)
+    manager_cls.return_value.cleanup_workspace.side_effect = PermissionError("file in use")
+
+    steps = [{"finalize": {"outcome": "NO_CHANGE_NEEDED", "outcome_detail": "already correct"}}]
+
+    with patch.object(agent_module, "AsyncSessionLocal", session_local), patch.object(
+        agent_module, "WorkspaceManager", manager_cls
+    ), patch.object(agent_module.agent_app, "astream", MagicMock(side_effect=_fake_astream_factory(steps))):
+        await _run_agent_task(
+            task_id=23,
+            workspace=tmp_path,
+            task_description="d",
+            test_target=None,
+            max_attempts=3,
+            repository_id=1,
+        )
+
+    assert task.status == "no_change_needed"
+    assert task.test_output == "already correct"

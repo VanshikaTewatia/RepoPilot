@@ -168,6 +168,14 @@ async def _persist_task_status(db: AsyncSession, task_id: int, status_value: str
     Never raises: a failed intermediate write must not abort the agent run
     -- the final outcome write in _run_agent_task's own commit is what
     actually determines correctness.
+
+    Phase 6G: rolls the session back on failure before returning. A failed
+    ``commit()`` leaves the session's transaction unusable for any further
+    query/commit on it (SQLAlchemy raises ``PendingRollbackError`` on the
+    next attempt) -- without this rollback, one transient commit failure
+    here would silently poison every subsequent intermediate write AND
+    ``_run_agent_task``'s own final outcome commit for the rest of this run,
+    since they all share this same long-lived session.
     """
     try:
         task = await _get_task(db, task_id)
@@ -176,6 +184,10 @@ async def _persist_task_status(db: AsyncSession, task_id: int, status_value: str
             await db.commit()
     except Exception as e:  # noqa: BLE001 -- an intermediate progress write is advisory-only and must never abort the run
         logger.warning(f"Failed to persist intermediate status '{status_value}' for task {task_id}: {e}")
+        try:
+            await db.rollback()
+        except Exception as rollback_error:
+            logger.warning(f"Failed to roll back session for task {task_id}: {rollback_error}")
 
 
 async def _run_agent_task(
@@ -268,10 +280,32 @@ async def _run_agent_task(
                 # Keep the workspace (and its path) while the fix awaits review.
                 task.workspace_path = str(workspace)
             else:
-                manager.cleanup_workspace(workspace)
+                # Phase 6G: cleanup is best-effort here -- a filesystem
+                # error (e.g. a lingering git/test-subprocess file lock)
+                # must never prevent the already-computed, correct outcome
+                # from being committed below. The outer except's own
+                # cleanup call already treats cleanup failure this way;
+                # this mirrors it so a cleanup failure can no longer
+                # overwrite a real NO_CHANGE_NEEDED/UNABLE_TO_VERIFY/FAILED
+                # outcome with a generic "failed" + rmtree error message.
+                try:
+                    manager.cleanup_workspace(workspace)
+                except Exception as cleanup_error:
+                    logger.warning(f"Failed to clean up workspace '{workspace}': {cleanup_error}")
             await db.commit()
         except Exception as e:  # noqa: BLE001 -- a background execution failure must never crash the process, and must never leave the task stuck merely because the HTTP request already returned
             logger.warning(f"Background agent execution failed for task {task_id}: {e}")
+            # Phase 6G: if the exception above came from a failed commit
+            # (e.g. the final outcome commit, or a _persist_task_status
+            # commit whose own rollback itself failed), the session's
+            # transaction is left unusable -- roll it back first so the
+            # failure-status commit below doesn't itself raise
+            # PendingRollbackError and get silently swallowed, which would
+            # leave the task stuck at its last intermediate status forever.
+            try:
+                await db.rollback()
+            except Exception as rollback_error:
+                logger.warning(f"Failed to roll back session for task {task_id}: {rollback_error}")
             try:
                 task = await _get_task(db, task_id)
                 if task is not None:
