@@ -3,15 +3,17 @@
 import asyncio
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import SessionDep
 from app.core.config import settings
 from app.core.logging import logger
 from app.db.models.repository import Repository
 from app.db.models.task import Task
+from app.db.session import AsyncSessionLocal
 from app.services.agent.graph import agent_app
 from app.services.agent import tools
 from app.services.git_service import GitService
@@ -19,6 +21,20 @@ from app.services.github_service import GitHubError, GitHubService, is_github_ur
 from app.services.workspace_manager import WorkspaceManager
 
 router = APIRouter(prefix="/tasks", tags=["Agent Tasks"])
+
+# Maps the agent's real-world outcome classification (see
+# app.services.agent.graph.finalize_node) to the task's persisted status.
+# Only "FIXED" keeps the isolated workspace alive for human review; a claim
+# that turned out to already be correct, or one that could not be verified
+# at all, is never presented as a pending fix. Module-level (Phase 6F) so
+# both create_and_run_task's fast-fail path and _run_agent_task's
+# background completion path share the exact same mapping.
+_OUTCOME_STATUS = {
+    "FIXED": "human_approval_required",
+    "NO_CHANGE_NEEDED": "no_change_needed",
+    "UNABLE_TO_VERIFY": "unable_to_verify",
+    "FAILED": "failed",
+}
 
 # Branch created in the ORIGINAL repository (never in the isolated workspace)
 # for a GitHub-backed task once its patch is approved.
@@ -70,8 +86,22 @@ class TaskReviewResponse(BaseModel):
 async def create_and_run_task(
     payload: CreateTaskRequest,
     db: SessionDep,
+    background_tasks: BackgroundTasks,
 ) -> Task:
-    """Create a new debugging/feature task and execute the LangGraph loop."""
+    """Create a new debugging/feature task and dispatch the LangGraph loop
+    to run in the background.
+
+    Phase 6F: this handler no longer awaits the agent graph -- it returns
+    as soon as the Task row and its isolated workspace exist, well before
+    the agent has produced any result, so the frontend's existing
+    task-detail redirect (using this response's `id`) and its existing
+    2-second poll of GET /tasks/{task_id} (see TaskPipeline.tsx) both work
+    immediately. `_run_agent_task` performs the actual execution in the
+    background, using its OWN database session -- the `db` session above
+    is request-scoped (see app.db.session.get_db) and is closed once this
+    handler returns; it must never be passed into or reused by code that
+    runs after the response is sent.
+    """
     repo_res = await db.execute(select(Repository).where(Repository.id == payload.repository_id))
     repo = repo_res.scalar_one_or_none()
     if not repo:
@@ -88,7 +118,10 @@ async def create_and_run_task(
     await db.refresh(task)
 
     # Create an isolated copy of the repository so the live repo is never
-    # modified during investigate/retrieve/plan/edit/test/retry.
+    # modified during investigate/retrieve/plan/edit/test/retry. Done here,
+    # synchronously, before returning -- a workspace-creation failure is
+    # still reported in this initial response exactly as it was before
+    # Phase 6F, rather than surfacing later as a background failure.
     manager = WorkspaceManager()
     try:
         workspace = manager.create_workspace(task.id, repo.local_path)
@@ -99,15 +132,93 @@ async def create_and_run_task(
         await db.refresh(task)
         return task
 
-    initial_state = {
-        "task_id": task.id,
-        "repository_id": repo.id,
+    background_tasks.add_task(
+        _run_agent_task,
+        task_id=task.id,
+        workspace=workspace,
+        task_description=task.description,
+        test_target=payload.test_target,
+        max_attempts=payload.max_attempts,
+        repository_id=repo.id,
+    )
+
+    return task
+
+
+async def _get_task(db: AsyncSession, task_id: int) -> Optional[Task]:
+    result = await db.execute(select(Task).where(Task.id == task_id))
+    return result.scalar_one_or_none()
+
+
+async def _persist_task_status(db: AsyncSession, task_id: int, status_value: str) -> None:
+    """Persist an intermediate status update immediately, so the frontend's
+    existing 2-second poll of GET /tasks/{task_id} (see TaskPipeline.tsx)
+    can observe progress mid-run.
+
+    Reuses the EXACT status strings the agent graph's own nodes already
+    assign to AgentState["status"] (e.g. "investigating", "retrieved",
+    "planning", "edited", "tested", "verified") -- no new status vocabulary
+    is invented. None of these values collide with any of the frontend's
+    terminal status sets (see frontend/lib/taskStatus.ts's
+    NEEDS_REVIEW_STATUSES/FINAL_STATUSES), so an intermediate write here
+    can never be mistaken for a finished task; unmapped-but-non-terminal
+    values already render gracefully via TaskPipeline.tsx's own
+    "waiting for the next agent stage" fallback.
+
+    Never raises: a failed intermediate write must not abort the agent run
+    -- the final outcome write in _run_agent_task's own commit is what
+    actually determines correctness.
+    """
+    try:
+        task = await _get_task(db, task_id)
+        if task is not None and task.status != status_value:
+            task.status = status_value
+            await db.commit()
+    except Exception as e:  # noqa: BLE001 -- an intermediate progress write is advisory-only and must never abort the run
+        logger.warning(f"Failed to persist intermediate status '{status_value}' for task {task_id}: {e}")
+
+
+async def _run_agent_task(
+    task_id: int,
+    workspace: Path,
+    task_description: str,
+    test_target: Optional[str],
+    max_attempts: int,
+    repository_id: int,
+) -> None:
+    """Execute the LangGraph agent loop for a task in the background.
+
+    Phase 6F: replaces create_and_run_task's former inline
+    `await agent_app.ainvoke(initial_state)`. Only WHEN this runs (after
+    the HTTP response has already been sent, via FastAPI's BackgroundTasks)
+    and HOW progress is surfaced mid-run change here -- the graph itself
+    (build_agent_graph/agent_app) is completely unmodified, and what a
+    successful or failed run ultimately persists is byte-for-byte the same
+    as create_and_run_task's pre-Phase-6F try/except and outcome-mapping
+    logic.
+
+    Opens its OWN fresh ``AsyncSessionLocal()`` session, scoped to this
+    entire background execution (spanning every retry attempt) -- never
+    the request-scoped session from create_and_run_task, which is already
+    closed by the time this function runs. Streams the graph via
+    ``agent_app.astream(..., stream_mode="updates")`` rather than
+    ``ainvoke()`` so ``task.status`` can be updated -- and committed,
+    immediately observable to a poller -- after each node completes, not
+    just once at the very end. Never lets an exception escape: a failure
+    anywhere in this function is caught, the task is marked "failed" with
+    the error persisted, and the workspace is cleaned up exactly as
+    create_and_run_task's pre-Phase-6F except-block already did.
+    """
+    manager = WorkspaceManager()
+    initial_state: Dict[str, Any] = {
+        "task_id": task_id,
+        "repository_id": repository_id,
         "workspace_dir": str(workspace),
-        "task_description": task.description,
-        "test_target": payload.test_target,
+        "task_description": task_description,
+        "test_target": test_target,
         "status": "pending",
         "attempt_count": 0,
-        "max_attempts": payload.max_attempts,
+        "max_attempts": max_attempts,
         "investigation_findings": "",
         "retrieved_context": [],
         "repair_plan": "",
@@ -118,57 +229,68 @@ async def create_and_run_task(
         "messages": [],
     }
 
-    # Maps the agent's real-world outcome classification (see
-    # app.services.agent.graph.finalize_node) to the task's persisted
-    # status. Only "FIXED" keeps the isolated workspace alive for human
-    # review; a claim that turned out to already be correct, or one that
-    # could not be verified at all, is never presented as a pending fix.
-    _OUTCOME_STATUS = {
-        "FIXED": "human_approval_required",
-        "NO_CHANGE_NEEDED": "no_change_needed",
-        "UNABLE_TO_VERIFY": "unable_to_verify",
-        "FAILED": "failed",
-    }
-
-    try:
-        final_state = await agent_app.ainvoke(initial_state)
-        outcome = final_state.get("outcome") or ("FIXED" if final_state.get("is_verified") else "FAILED")
-        task.status = _OUTCOME_STATUS.get(outcome, "failed")
-        task.attempts = final_state.get("attempt_count", 0)
-        test_res = final_state.get("test_results") or {}
-        outcome_detail = final_state.get("outcome_detail")
-        task.test_output = "\n\n".join(p for p in (test_res.get("output"), outcome_detail) if p) or None
-        if outcome == "FIXED":
-            # Stage all workspace changes (incl. new files) so the captured
-            # diff is complete and directly applicable via `git apply`.
-            GitService.stage_all_changes(workspace)
-            # Capture and persist review information from the isolated
-            # workspace; the live repository is never read for this.
-            task.patch_content = GitService.get_workspace_diff(workspace)
-            task.changed_files = GitService.get_changed_files(workspace)
-            # Keep the workspace (and its path) while the fix awaits review.
-            task.workspace_path = str(workspace)
-        else:
-            manager.cleanup_workspace(workspace)
-        await db.commit()
-        await db.refresh(task)
-    except Exception as e:
-        task.status = "failed"
-        task.test_output = str(e)
+    async with AsyncSessionLocal() as db:
         try:
-            manager.cleanup_workspace(workspace)
-        except Exception as cleanup_error:
-            logger.warning(f"Failed to clean up workspace '{workspace}': {cleanup_error}")
-        await db.commit()
-        await db.refresh(task)
+            final_state: Dict[str, Any] = dict(initial_state)
+            async for step in agent_app.astream(initial_state, stream_mode="updates"):
+                for node_output in step.values():
+                    if not isinstance(node_output, dict):
+                        continue
+                    final_state.update(node_output)
+                    node_status = node_output.get("status")
+                    if node_status:
+                        await _persist_task_status(db, task_id, node_status)
 
-    return task
+            outcome = final_state.get("outcome") or ("FIXED" if final_state.get("is_verified") else "FAILED")
+            task = await _get_task(db, task_id)
+            if task is None:
+                # Task row is gone (e.g. deleted mid-run) -- nothing left to
+                # persist, but the workspace this function owns still needs
+                # cleanup unless it would have been kept for review.
+                if outcome != "FIXED":
+                    manager.cleanup_workspace(workspace)
+                return
+
+            task.status = _OUTCOME_STATUS.get(outcome, "failed")
+            task.attempts = final_state.get("attempt_count", 0)
+            test_res = final_state.get("test_results") or {}
+            outcome_detail = final_state.get("outcome_detail")
+            task.test_output = "\n\n".join(p for p in (test_res.get("output"), outcome_detail) if p) or None
+            if outcome == "FIXED":
+                # Stage all workspace changes (incl. new files) so the
+                # captured diff is complete and directly applicable via
+                # `git apply`.
+                GitService.stage_all_changes(workspace)
+                # Capture and persist review information from the isolated
+                # workspace; the live repository is never read for this.
+                task.patch_content = GitService.get_workspace_diff(workspace)
+                task.changed_files = GitService.get_changed_files(workspace)
+                # Keep the workspace (and its path) while the fix awaits review.
+                task.workspace_path = str(workspace)
+            else:
+                manager.cleanup_workspace(workspace)
+            await db.commit()
+        except Exception as e:  # noqa: BLE001 -- a background execution failure must never crash the process, and must never leave the task stuck merely because the HTTP request already returned
+            logger.warning(f"Background agent execution failed for task {task_id}: {e}")
+            try:
+                task = await _get_task(db, task_id)
+                if task is not None:
+                    task.status = "failed"
+                    task.test_output = str(e)
+                    await db.commit()
+            except Exception as db_error:
+                logger.warning(f"Failed to persist failure status for task {task_id}: {db_error}")
+            try:
+                manager.cleanup_workspace(workspace)
+            except Exception as cleanup_error:
+                logger.warning(f"Failed to clean up workspace '{workspace}': {cleanup_error}")
 
 
 @router.post("/fix", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
 async def fix_bug_endpoint(
     payload: FixBugRequest,
     db: SessionDep,
+    background_tasks: BackgroundTasks,
 ) -> Task:
     """Convenience endpoint to initiate a bug-fix agent task."""
     create_req = CreateTaskRequest(
@@ -178,7 +300,7 @@ async def fix_bug_endpoint(
         test_target=payload.test_target,
         max_attempts=payload.max_attempts,
     )
-    return await create_and_run_task(create_req, db)
+    return await create_and_run_task(create_req, db, background_tasks)
 
 
 @router.get("/{task_id}", response_model=TaskResponse)

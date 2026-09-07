@@ -92,7 +92,7 @@ describe("CreateTaskPage", () => {
     await user.type(screen.getByPlaceholderText(/describe the bug/i), "Fix it");
     await user.click(screen.getByRole("button", { name: /start coding agent/i }));
 
-    expect(await screen.findByText(/agent is working on the repository copy/i)).toBeInTheDocument();
+    expect(await screen.findByText(/setting up an isolated copy of the repository/i)).toBeInTheDocument();
     resolveSubmit(baseTask());
     await waitFor(() => expect(pushMock).toHaveBeenCalled());
   });

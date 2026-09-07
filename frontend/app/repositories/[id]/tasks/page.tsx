@@ -59,8 +59,8 @@ export default function CreateTaskPage() {
         {creating ? (
           <p className="text-sm text-indigo-300 bg-zinc-950 border border-zinc-800 rounded-lg p-4 inline-flex items-center gap-2">
             <span className="w-3 h-3 rounded-full border-2 border-indigo-400 border-t-transparent animate-spin" />
-            Agent is working on the repository copy — this can take up to a
-            few minutes. You&apos;ll be taken to the task once it starts.
+            Setting up an isolated copy of the repository — you&apos;ll be
+            taken to the task in a moment to watch the agent work.
           </p>
         ) : (
           <TaskCreateForm repo={repo} onSubmit={handleCreateTask} />

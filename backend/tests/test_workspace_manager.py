@@ -181,6 +181,21 @@ def test_invalid_source_fails_safely():
 # -------------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_agent_execution_receives_isolated_workspace():
+    """Phase 6F: create_and_run_task no longer executes the graph inline --
+    it dispatches _run_agent_task via BackgroundTasks and returns
+    immediately. This test now runs the scheduled background task itself
+    (via `await background_tasks()`, exactly what Starlette does after the
+    response is sent) so every original assertion below -- workspace
+    isolation, the live repository staying untouched, and the eventual
+    human_approval_required/workspace_path/patch_content outcome -- is
+    still proven, just against the new dispatch mechanism. The mocked
+    agent_app now provides `astream` (yielding one `{node: state}` update,
+    matching agent_app.astream's real "updates" shape) instead of the old
+    `ainvoke`, and _run_agent_task's own AsyncSessionLocal is mocked to
+    operate on the SAME Task object create_and_run_task already returned,
+    since a real Postgres connection is not available in this test."""
+    from fastapi import BackgroundTasks
+
     from app.api.v1.agent import CreateTaskRequest, create_and_run_task
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -190,17 +205,22 @@ async def test_agent_execution_receives_isolated_workspace():
 
         captured = {}
 
-        async def fake_ainvoke(state):
-            """Stand-in for the LangGraph loop: records state and edits 'the repo'."""
+        async def fake_astream(state, **kwargs):
+            """Stand-in for the LangGraph loop: records state and edits 'the
+            repo', then yields a single finalize-shaped update -- matching
+            agent_app.astream(..., stream_mode="updates")'s real
+            {node_name: partial_state} shape."""
             captured.update(state)
             ws = Path(state["workspace_dir"])
             (ws / "src" / "app.py").write_text("VALUE = 42\n", encoding="utf-8")
-            return {
-                **state,
-                "is_verified": True,
-                "attempt_count": 1,
-                "test_results": {"output": "1 passed"},
-                "status": "verified",
+            yield {
+                "finalize": {
+                    "is_verified": True,
+                    "attempt_count": 1,
+                    "test_results": {"output": "1 passed"},
+                    "outcome": "FIXED",
+                    "outcome_detail": "Applied 1 patch(es) and verification passed.",
+                }
             }
 
         exec_result = MagicMock()
@@ -210,8 +230,11 @@ async def test_agent_execution_receives_isolated_workspace():
         db.add = MagicMock()
         db.commit = AsyncMock()
 
+        created_task_holder: dict = {}
+
         async def fake_refresh(obj, *args, **kwargs):
             obj.id = 7
+            created_task_holder["task"] = obj
 
         db.refresh = AsyncMock(side_effect=fake_refresh)
 
@@ -220,10 +243,37 @@ async def test_agent_execution_receives_isolated_workspace():
             title="Fix VALUE",
             description="Set VALUE to 42",
         )
+        background_tasks = BackgroundTasks()
+
+        # _run_agent_task opens its OWN session (Phase 6F's hard session-
+        # safety requirement) -- fake it to operate on the exact same Task
+        # object create_and_run_task already returned (`result` below IS
+        # this object), so this test can still assert on the final,
+        # fully-applied outcome without a real database.
+        background_db = MagicMock()
+
+        async def bg_execute(stmt):
+            res = MagicMock()
+            res.scalar_one_or_none.return_value = created_task_holder.get("task")
+            return res
+
+        background_db.execute = AsyncMock(side_effect=bg_execute)
+        background_db.commit = AsyncMock()
+        session_cm = MagicMock()
+        session_cm.__aenter__ = AsyncMock(return_value=background_db)
+        session_cm.__aexit__ = AsyncMock(return_value=False)
+        session_local = MagicMock(return_value=session_cm)
 
         with patch.object(settings, "workspace_dir", root / "workspaces"):
-            with patch("app.api.v1.agent.agent_app", SimpleNamespace(ainvoke=fake_ainvoke)):
-                result = await create_and_run_task(payload, db)
+            with patch("app.api.v1.agent.agent_app", SimpleNamespace(astream=fake_astream)), patch(
+                "app.api.v1.agent.AsyncSessionLocal", session_local
+            ):
+                result = await create_and_run_task(payload, db, background_tasks)
+                # Phase 6F: execution now happens in the background -- run
+                # the scheduled task now, exactly as Starlette would after
+                # sending the response, so this test can still observe the
+                # eventual, fully-completed outcome.
+                await background_tasks()
 
         # The agent received an isolated copy, not the live repository path
         assert captured["workspace_dir"] != str(source)
