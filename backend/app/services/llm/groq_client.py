@@ -85,18 +85,34 @@ def _build_messages(system_instruction: str, prompt: str) -> List[Dict[str, str]
     return messages
 
 
+_SIZE_ESTIMATE_SAFETY_MARGIN = 1.2
+"""Multiplier applied to the cheap chars/4 token estimate before comparing
+against ``settings.groq_tpm_limit``. A real production request estimated at
+<=7500 tokens by the raw chars/4 heuristic was actually tokenized by Groq's
+real GPT-OSS tokenizer at 8055 tokens (HTTP 413, "TPM Limit 8000, Requested
+8055") -- a >7% undercount on this evidence-heavy, JSON/code-like content
+that chars/4 does not track closely enough to use as a hard ceiling with no
+headroom. 20% comfortably covers that observed gap without switching to a
+real (network-cost) tokenizer."""
+
+
 def _check_request_size(prompt: str, system_instruction: str) -> None:
     """Raise ``GroqRequestTooLargeError`` before any network call if the
-    estimated token count already exceeds ``settings.groq_tpm_limit`` --
-    live testing measured real Deep Q&A/diagnosis prompts at 16,000-44,000
-    tokens against this account's real, confirmed 8000 TPM cap for the
-    configured model; failing fast here avoids spending a network round
-    trip on a request that would otherwise fail with HTTP 413 anyway."""
-    estimated = _estimate_tokens(system_instruction) + _estimate_tokens(prompt)
+    estimated token count, inflated by ``_SIZE_ESTIMATE_SAFETY_MARGIN`` to
+    absorb chars/4-vs-real-tokenizer estimation error, already exceeds
+    ``settings.groq_tpm_limit`` -- live testing measured real Deep Q&A/
+    diagnosis prompts at 16,000-44,000 tokens against this account's real,
+    confirmed 8000 TPM cap for the configured model; failing fast here
+    avoids spending a network round trip on a request that would otherwise
+    fail with HTTP 413 anyway."""
+    raw_estimate = _estimate_tokens(system_instruction) + _estimate_tokens(prompt)
+    estimated = math.ceil(raw_estimate * _SIZE_ESTIMATE_SAFETY_MARGIN)
     if estimated > settings.groq_tpm_limit:
         raise GroqRequestTooLargeError(
-            f"Estimated request size (~{estimated} tokens) exceeds the configured Groq "
-            f"fallback limit (~{settings.groq_tpm_limit} tokens); this request was not sent."
+            f"Estimated request size (~{estimated} tokens, including a "
+            f"{round((_SIZE_ESTIMATE_SAFETY_MARGIN - 1) * 100)}% estimation-error safety margin) "
+            f"exceeds the configured Groq fallback limit (~{settings.groq_tpm_limit} tokens); "
+            f"this request was not sent."
         )
 
 

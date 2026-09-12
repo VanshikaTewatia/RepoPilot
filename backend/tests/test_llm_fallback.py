@@ -353,6 +353,73 @@ async def test_call_groq_async_rejects_oversized_request_without_a_network_call(
     mock_post.assert_not_called()
 
 
+# ===========================================================================
+# Real production failure reproduction: a request whose raw chars/4 estimate
+# was <=groq_tpm_limit (7500) still reached Groq and failed with a real
+# HTTP 413 ("TPM Limit 8000, Requested 8055") -- the raw heuristic undercounts
+# real GPT-OSS tokenization on this content by >7%, and the pre-call guard
+# had no safety margin to absorb that error. These tests reproduce the exact
+# gap: a prompt sized so the *raw* estimate is comfortably within the old
+# no-margin threshold (so it would have reached Groq before this fix) but
+# must now be rejected once the safety margin is applied.
+# ===========================================================================
+def _prompt_with_raw_token_estimate(raw_tokens: int) -> str:
+    """Chars/4 is exact for a multiple of 4, so this reproduces a specific
+    raw (pre-margin) token estimate deterministically."""
+    return "x" * (raw_tokens * 4)
+
+
+def test_call_groq_sync_rejects_request_that_the_old_raw_estimate_would_have_allowed():
+    """Reproduces the real 8055-vs-8000 failure: raw estimate (7400) is under
+    groq_tpm_limit (7500) -- the pre-fix guard would have let this reach
+    Groq -- but with the 20% safety margin it estimates to 8880 tokens,
+    correctly rejected before any network call."""
+    from app.services.llm import groq_client
+
+    assert settings.groq_tpm_limit == 7500, "test assumes the documented 7500 default"
+    raw_tokens = 7400
+    assert raw_tokens <= settings.groq_tpm_limit  # would have passed the old, margin-free guard
+    prompt = _prompt_with_raw_token_estimate(raw_tokens)
+
+    with patch("app.core.config.settings.groq_api_key", "real_like_groq_key"):
+        with patch.object(httpx.Client, "post") as mock_post:
+            with pytest.raises(groq_client.GroqRequestTooLargeError):
+                groq_client.call_groq_sync(prompt=prompt, system_instruction="")
+
+    mock_post.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_call_groq_async_rejects_request_that_the_old_raw_estimate_would_have_allowed():
+    from app.services.llm import groq_client
+
+    raw_tokens = 7400
+    prompt = _prompt_with_raw_token_estimate(raw_tokens)
+
+    with patch("app.core.config.settings.groq_api_key", "real_like_groq_key"):
+        with patch.object(httpx.AsyncClient, "post") as mock_post:
+            with pytest.raises(groq_client.GroqRequestTooLargeError):
+                await groq_client.call_groq_async(prompt=prompt, system_instruction="")
+
+    mock_post.assert_not_called()
+
+
+def test_call_groq_sync_moderately_sized_request_still_within_margin_is_allowed():
+    """The safety margin must not be so aggressive that it rejects requests
+    with real headroom: a 6000-raw-token prompt (6000*1.2=7200 <= 7500)
+    should still reach Groq."""
+    from app.services.llm import groq_client
+
+    prompt = _prompt_with_raw_token_estimate(6000)
+
+    with patch("app.core.config.settings.groq_api_key", "real_like_groq_key"):
+        with patch.object(httpx.Client, "post", return_value=_groq_response("ok")) as mock_post:
+            result = groq_client.call_groq_sync(prompt=prompt, system_instruction="")
+
+    assert result == "ok"
+    mock_post.assert_called_once()
+
+
 def test_call_groq_sync_within_budget_is_unaffected():
     """Critical regression guard: the vast majority of real fallback calls
     (small prompts, already proven to succeed via Groq in the live
