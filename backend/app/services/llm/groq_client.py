@@ -27,6 +27,7 @@ its own caller, so it must not need an event loop of its own):
 
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -47,12 +48,56 @@ class GroqAPIError(RuntimeError):
     API response)."""
 
 
+class GroqRequestTooLargeError(RuntimeError):
+    """Raised BEFORE any network call when the request is already estimated
+    to exceed Groq's tokens-per-minute limit for the configured model/tier.
+
+    Deliberately a distinct type from ``GroqAPIError``: live testing showed
+    this is a common, structurally different failure from a genuine outage
+    or true rate limit -- waiting and retrying can never help a request
+    that is simply too large, so callers (see
+    ``app.services.llm.fallback``) must surface a different, more useful
+    message for it than the generic "both providers failed, try again
+    later" one used for an actual provider failure.
+    """
+
+
+def _estimate_tokens(text: str) -> int:
+    """Cheap local estimate of token count using the standard ~4
+    chars/token heuristic -- identical in spirit to
+    ``app.services.embeddings.rate_limiter.estimate_tokens``, duplicated
+    here (rather than imported) to keep ``app.services.llm`` independent of
+    ``app.services.embeddings`` -- see ``app.services.llm.errors``'s module
+    docstring for the same rationale already applied to this package's
+    Gemini rate-limit detection. Deliberately avoids calling a real token
+    counter, which would itself cost a network round-trip just to plan
+    around a request-size limit."""
+    if not text:
+        return 0
+    return max(1, math.ceil(len(text) / 4))
+
+
 def _build_messages(system_instruction: str, prompt: str) -> List[Dict[str, str]]:
     messages: List[Dict[str, str]] = []
     if system_instruction:
         messages.append({"role": "system", "content": system_instruction})
     messages.append({"role": "user", "content": prompt})
     return messages
+
+
+def _check_request_size(prompt: str, system_instruction: str) -> None:
+    """Raise ``GroqRequestTooLargeError`` before any network call if the
+    estimated token count already exceeds ``settings.groq_tpm_limit`` --
+    live testing measured real Deep Q&A/diagnosis prompts at 16,000-44,000
+    tokens against this account's real, confirmed 8000 TPM cap for the
+    configured model; failing fast here avoids spending a network round
+    trip on a request that would otherwise fail with HTTP 413 anyway."""
+    estimated = _estimate_tokens(system_instruction) + _estimate_tokens(prompt)
+    if estimated > settings.groq_tpm_limit:
+        raise GroqRequestTooLargeError(
+            f"Estimated request size (~{estimated} tokens) exceeds the configured Groq "
+            f"fallback limit (~{settings.groq_tpm_limit} tokens); this request was not sent."
+        )
 
 
 def _request_payload(prompt: str, system_instruction: str, groq_model: Optional[str]) -> Dict[str, Any]:
@@ -86,9 +131,11 @@ def _extract_content(response: httpx.Response) -> str:
 async def call_groq_async(
     *, prompt: str, system_instruction: str = "", groq_model: Optional[str] = None
 ) -> str:
-    """Async Groq chat-completion call. Raises ``GroqNotConfiguredError`` or
+    """Async Groq chat-completion call. Raises ``GroqNotConfiguredError``,
+    ``GroqRequestTooLargeError`` (before any network call), or
     ``GroqAPIError`` on failure; never returns a partial/guessed result."""
     api_key = _require_api_key()
+    _check_request_size(prompt, system_instruction)
     payload = _request_payload(prompt, system_instruction, groq_model)
     async with httpx.AsyncClient(
         base_url=settings.groq_api_base_url, timeout=settings.groq_timeout_seconds
@@ -106,8 +153,11 @@ def call_groq_sync(
 ) -> str:
     """Synchronous Groq chat-completion call for the one call site
     (``_generate_patches_with_gemini``) that's already running off the main
-    event loop inside a worker thread -- see module docstring."""
+    event loop inside a worker thread -- see module docstring. Raises
+    ``GroqNotConfiguredError``, ``GroqRequestTooLargeError`` (before any
+    network call), or ``GroqAPIError`` on failure."""
     api_key = _require_api_key()
+    _check_request_size(prompt, system_instruction)
     payload = _request_payload(prompt, system_instruction, groq_model)
     with httpx.Client(
         base_url=settings.groq_api_base_url, timeout=settings.groq_timeout_seconds

@@ -132,6 +132,13 @@ class Settings(BaseSettings):
         default=30.0,
         description="Request timeout in seconds for a Groq fallback generation call",
     )
+    groq_tpm_limit: int = Field(
+        default=7500,
+        description="Conservative estimated-tokens-per-request ceiling for the Groq fallback model's "
+        "tokens-per-minute tier limit (live-confirmed at 8000 for the current account/model) -- a "
+        "request estimated to exceed this is rejected before ever calling Groq, rather than spending "
+        "a network round-trip on a request that would fail with HTTP 413 anyway",
+    )
 
     # -------------------------------------------------------------------------
     # Database (PostgreSQL 16 + pgvector)

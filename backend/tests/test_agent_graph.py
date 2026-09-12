@@ -915,6 +915,71 @@ def test_generate_patches_ordinary_gemini_failure_never_calls_groq():
     assert patches == []
 
 
+# ---------------------------------------------------------------------------
+# Prompt-size bounding (Issue #3): see app.services.diagnosis.diagnoser.
+# MAX_RETRIEVED_CONTEXT_CHARS's identical constant for the full rationale
+# (live-measured 16k-44k token unbounded prompts silently defeating the
+# Groq fallback's 8000 TPM cap).
+# ---------------------------------------------------------------------------
+def test_generate_patches_context_truncates_when_over_budget():
+    from app.services.agent.graph import MAX_RETRIEVED_CONTEXT_CHARS
+
+    mock_response = MagicMock()
+    mock_response.text = json.dumps([])
+    captured = {}
+
+    def capture_generate_content(*args, **kwargs):
+        captured.update(kwargs)
+        return mock_response
+
+    mock_client = MagicMock()
+    mock_client.models.generate_content.side_effect = capture_generate_content
+
+    huge_content = "x" * (MAX_RETRIEVED_CONTEXT_CHARS + 5000)
+    with patch("app.core.config.settings.gemini_api_key", "real_like_test_key_12345"):
+        with patch("google.genai.Client", return_value=mock_client):
+            _generate_patches_with_gemini(
+                task_description="Fix VIP discount calculation",
+                retrieved_context=[
+                    {"file_path": "src/order_service.py", "content": huge_content, "total_lines": 50}
+                ],
+            )
+
+    prompt = captured["contents"]
+    assert len(prompt) < len(huge_content)
+    assert "truncated" in prompt
+
+
+def test_generate_patches_context_does_not_truncate_within_budget():
+    """Critical quality-preservation guard: normal-sized context (the
+    overwhelming majority of real patch-generation requests) must be
+    completely unaffected."""
+    mock_response = MagicMock()
+    mock_response.text = json.dumps([])
+    captured = {}
+
+    def capture_generate_content(*args, **kwargs):
+        captured.update(kwargs)
+        return mock_response
+
+    mock_client = MagicMock()
+    mock_client.models.generate_content.side_effect = capture_generate_content
+
+    small_content = "def f():\n    pass\n"
+    with patch("app.core.config.settings.gemini_api_key", "real_like_test_key_12345"):
+        with patch("google.genai.Client", return_value=mock_client):
+            _generate_patches_with_gemini(
+                task_description="Fix VIP discount calculation",
+                retrieved_context=[
+                    {"file_path": "src/order_service.py", "content": small_content, "total_lines": 2}
+                ],
+            )
+
+    prompt = captured["contents"]
+    assert "truncated" not in prompt
+    assert small_content in prompt
+
+
 # ===========================================================================
 # Phase 7: should_continue -- a confirmed environment/tooling failure must
 # never burn the retry budget; a genuine test failure must retry exactly as

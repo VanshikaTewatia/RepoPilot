@@ -461,11 +461,36 @@ def test_finalize_node_reproduced_baseline_without_post_fix_confirmation_never_y
     assert out["outcome"] == "UNABLE_TO_VERIFY"
 
 
-def test_finalize_node_not_applicable_baseline_allows_fixed():
-    """NOT_APPLICABLE is not the same thing as UNABLE_TO_REPRODUCE -- when
-    there was genuinely no meaningful reproduction to attempt, existing
-    fix/verification behavior is unaffected."""
+def test_finalize_node_not_applicable_baseline_without_pre_edit_evidence_is_unable_to_verify():
+    """Superseded expectation (was: NOT_APPLICABLE unconditionally allows
+    FIXED, "since there was genuinely no meaningful reproduction to
+    attempt"). That reasoning does not hold: NOT_APPLICABLE means no
+    LLM-guessed reproduction was CONSTRUCTED for the claim -- it is the
+    correct, preferred planner response for a genuine bug whose
+    evidence-gathering stages just didn't build a repro (see
+    test_outcome_fixed_when_bug_confirmed_and_patch_verified in
+    test_agent_outcomes.py, which reaches FIXED from this exact
+    baseline_status), AND for a fabricated bug with nothing to build one
+    from -- indistinguishable from baseline_status alone. Without
+    baseline_test_results (the pre-edit test snapshot baseline_node now
+    captures in exactly this case -- see AgentState.baseline_test_results'
+    own docstring), there is no evidence a real test ever failed before the
+    edit, so FIXED must not be granted. See
+    test_finalize_node_not_applicable_baseline_with_pre_edit_failure_is_fixed
+    below for the case where that evidence IS present."""
     state = _verified_with_applied_patch_state(baseline_status="NOT_APPLICABLE")
+    out = finalize_node(state)
+    assert out["outcome"] == "UNABLE_TO_VERIFY"
+
+
+def test_finalize_node_not_applicable_baseline_with_pre_edit_failure_is_fixed():
+    """The positive counterpart of the test above: NOT_APPLICABLE baseline
+    status plus a genuine pre-edit test failure (a real bug, independently
+    observed before any edit) still reaches FIXED exactly as before."""
+    state = _verified_with_applied_patch_state(
+        baseline_status="NOT_APPLICABLE",
+        baseline_test_results={"available": True, "failed": 1, "passed": 2},
+    )
     out = finalize_node(state)
     assert out["outcome"] == "FIXED"
 

@@ -66,6 +66,22 @@ class AgentState(TypedDict, total=False):
     # baseline_result / post_fix_reproduction_result, each already bounded
     # by Phase 4A.
     reproduction_spec: Optional[Dict[str, Any]]
+    # Set only when baseline_status == "NOT_APPLICABLE": the result of
+    # running the workspace's OWN existing verification command (the exact
+    # same call test_node makes -- no new Docker mechanism, no new LLM
+    # call) against the UNTOUCHED, pre-edit workspace, once, inside
+    # baseline_node. NOT_APPLICABLE means no LLM-guessed reproduction was
+    # constructed for this claim -- app.services.baseline.planner's own
+    # instructions call this the correct, preferred answer whenever no
+    # trustworthy procedure can be built, which makes it the common case
+    # for genuine, simple fixes too, not just fabricated ones; baseline_
+    # status alone cannot tell the two apart. finalize_node uses this field
+    # as the deterministic tiebreaker for that one ambiguous case: whether
+    # a real test already failed before any edit was made. None whenever
+    # baseline_status != "NOT_APPLICABLE" (the other three values already
+    # gate FIXED on their own -- see finalize_node) or if this probe itself
+    # failed unexpectedly (never a verdict about the bug either way).
+    baseline_test_results: Optional[Dict[str, Any]]
     # Phase 5: outcome of rerunning reproduction_spec after edit_node
     # applies a candidate fix -- "REPRODUCED" (the previously-established
     # failure is still present) | "NOT_REPRODUCED" (no longer observed) |

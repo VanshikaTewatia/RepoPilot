@@ -194,3 +194,32 @@ async def test_diagnose_without_gemini_key_uses_deterministic_mock():
     assert result.status == DiagnosisStatus.DIAGNOSED
     assert result.confidence == "inferred"
     assert len(result.hypotheses) == 1
+
+
+# ---------------------------------------------------------------------------
+# Prompt-size bounding (Issue #3): unbounded retrieved_context was
+# live-measured at 16,000-44,000 tokens for a real, moderately sized
+# repository -- comfortably within Gemini's context window, but far past
+# Groq's fallback tier's real, confirmed 8000 TPM cap, silently defeating
+# the Gemini->Groq fallback for exactly the substantive diagnosis calls it
+# exists to protect. See MAX_RETRIEVED_CONTEXT_CHARS's own module-level
+# comment for the full rationale.
+# ---------------------------------------------------------------------------
+from app.services.diagnosis.diagnoser import MAX_RETRIEVED_CONTEXT_CHARS, _format_retrieved_context
+
+
+def test_format_retrieved_context_truncates_when_over_budget():
+    huge_content = "x" * (MAX_RETRIEVED_CONTEXT_CHARS + 5000)
+    formatted = _format_retrieved_context([_context(content=huge_content)])
+    assert len(formatted) < len(huge_content)
+    assert "truncated" in formatted
+
+
+def test_format_retrieved_context_does_not_truncate_within_budget():
+    """Critical quality-preservation guard: normal-sized evidence (the
+    overwhelming majority of real requests) must be completely unaffected
+    -- byte-for-byte identical to the untruncated formatting."""
+    small_content = "def subtotal():\n    return sum(i.price for i in items)\n"
+    formatted = _format_retrieved_context([_context(content=small_content)])
+    assert "truncated" not in formatted
+    assert small_content in formatted

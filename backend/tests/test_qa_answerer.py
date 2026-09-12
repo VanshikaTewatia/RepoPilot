@@ -369,3 +369,33 @@ async def test_generate_answer_ordinary_gemini_failure_never_calls_groq(real_loo
 
     mock_groq.assert_not_called()
     assert answer.confidence == "inferred"
+
+
+# ---------------------------------------------------------------------------
+# Prompt-size bounding (Issue #3): unbounded evidence was live-measured at
+# 16,000-44,000 tokens for a real, moderately sized repository --
+# comfortably within Gemini's context window, but far past Groq's fallback
+# tier's real, confirmed 8000 TPM cap, silently defeating the Gemini->Groq
+# fallback for exactly the substantive Deep Q&A questions it exists to
+# protect. See MAX_EVIDENCE_CHARS's own module-level comment for the full
+# rationale.
+# ---------------------------------------------------------------------------
+from app.services.qa.answerer import MAX_EVIDENCE_CHARS, _format_evidence
+
+
+def test_format_evidence_truncates_when_over_budget():
+    huge_chunk = RetrievedChunk(
+        file_path="src/cart.py", symbol_name="subtotal", symbol_type="function",
+        start_line=1, end_line=5, source_code="x" * (MAX_EVIDENCE_CHARS + 5000), similarity_score=0.9,
+    )
+    formatted = _format_evidence([_evidence(chunks=[huge_chunk])])
+    assert len(formatted) < MAX_EVIDENCE_CHARS + 5000
+    assert "truncated" in formatted
+
+
+def test_format_evidence_does_not_truncate_within_budget():
+    """Critical quality-preservation guard: normal-sized evidence (the
+    overwhelming majority of real questions) must be completely unaffected."""
+    formatted = _format_evidence([_evidence(chunks=[_chunk("src/cart.py", "subtotal")])])
+    assert "truncated" not in formatted
+    assert "stub" in formatted

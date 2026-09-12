@@ -89,6 +89,36 @@ def insufficient_evidence_diagnosis() -> Diagnosis:
     )
 
 
+# Caps the total formatted evidence embedded in the diagnosis prompt.
+# Unbounded retrieved_context (several real files' full content) was
+# observed live to routinely reach 16,000-44,000 tokens for a moderately
+# sized repository -- comfortably within Gemini's own context window, but
+# far past Groq's fallback tier's 8000-tokens-per-minute cap, silently
+# defeating the Gemini->Groq fallback for exactly the substantive requests
+# it exists to protect. 24000 chars (~6000 tokens at the standard ~4
+# chars/token estimate -- see app.services.embeddings.rate_limiter.
+# estimate_tokens) leaves comfortable headroom under that cap while still
+# covering realistic single/multi-file diagnosis evidence; mirrors the
+# identical bounding already applied to investigation_findings in
+# app.services.baseline.planner.MAX_FINDINGS_CHARS. A module-local copy of
+# the truncation helper (rather than importing app.services.baseline.
+# bound_output) preserves this module's own "no dependency on
+# reproduction, Docker, workspace creation" design principle (see module
+# docstring) -- Python would otherwise import the whole baseline package
+# just for one pure string helper.
+MAX_RETRIEVED_CONTEXT_CHARS = 24000
+
+
+def _bound_output(text: str, limit: int = MAX_RETRIEVED_CONTEXT_CHARS) -> str:
+    """Truncate ``text`` to at most ``limit`` characters, noting how much
+    was cut so evidence is never silently incomplete -- identical behavior
+    to ``app.services.baseline.executor.bound_output``."""
+    if len(text) <= limit:
+        return text
+    omitted = len(text) - limit
+    return f"{text[:limit]}\n... [truncated, {omitted} more characters]"
+
+
 def _format_retrieved_context(retrieved_context: List[Dict[str, Any]]) -> str:
     parts: List[str] = []
     for item in retrieved_context:
@@ -96,7 +126,7 @@ def _format_retrieved_context(retrieved_context: List[Dict[str, Any]]) -> str:
         content = item.get("content", "")
         total_lines = item.get("total_lines", 0)
         parts.append(f"### File: {fpath} ({total_lines} lines total)\n```\n{content}\n```")
-    return "\n\n".join(parts)
+    return _bound_output("\n\n".join(parts))
 
 
 def _build_diagnosis_prompt(

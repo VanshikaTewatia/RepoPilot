@@ -316,3 +316,93 @@ async def test_groq_fallback_call_does_not_block_the_event_loop():
             )
 
     assert other_task_ran_at["t"] - start < 0.2
+
+
+# ===========================================================================
+# Issue #3: Groq pre-call request-size guard. Live testing measured real
+# Deep Q&A/diagnosis prompts at 16,000-44,000 tokens against this account's
+# real, confirmed 8000 TPM cap for the configured Groq model -- every one
+# of those real attempts failed with HTTP 413 after a wasted network round
+# trip. These tests prove the fix: reject an oversized request BEFORE any
+# network call, and surface a message distinct from the generic
+# both-providers-failed one (since waiting can never help a request that
+# is simply too large).
+# ===========================================================================
+def test_call_groq_sync_rejects_oversized_request_without_a_network_call():
+    from app.services.llm import groq_client
+
+    huge_prompt = "x" * (settings.groq_tpm_limit * 4 + 40000)  # comfortably over budget in tokens
+    with patch("app.core.config.settings.groq_api_key", "real_like_groq_key"):
+        with patch.object(httpx.Client, "post") as mock_post:
+            with pytest.raises(groq_client.GroqRequestTooLargeError):
+                groq_client.call_groq_sync(prompt=huge_prompt, system_instruction="")
+
+    mock_post.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_call_groq_async_rejects_oversized_request_without_a_network_call():
+    from app.services.llm import groq_client
+
+    huge_prompt = "x" * (settings.groq_tpm_limit * 4 + 40000)
+    with patch("app.core.config.settings.groq_api_key", "real_like_groq_key"):
+        with patch.object(httpx.AsyncClient, "post") as mock_post:
+            with pytest.raises(groq_client.GroqRequestTooLargeError):
+                await groq_client.call_groq_async(prompt=huge_prompt, system_instruction="")
+
+    mock_post.assert_not_called()
+
+
+def test_call_groq_sync_within_budget_is_unaffected():
+    """Critical regression guard: the vast majority of real fallback calls
+    (small prompts, already proven to succeed via Groq in the live
+    acceptance tests) must never be rejected by this new guard."""
+    from app.services.llm import groq_client
+
+    with patch("app.core.config.settings.groq_api_key", "real_like_groq_key"):
+        with patch.object(httpx.Client, "post", return_value=_groq_response("ok")) as mock_post:
+            result = groq_client.call_groq_sync(prompt="a short prompt", system_instruction="be terse")
+
+    assert result == "ok"
+    mock_post.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_generate_with_fallback_classifies_too_large_request_distinctly():
+    """The user-facing message for an oversized fallback request must be
+    distinct from (and not claim "try again later" like) the generic
+    both-providers-failed message -- waiting can never help a request that
+    is simply too big."""
+    from app.services.llm.groq_client import GroqRequestTooLargeError
+
+    gemini_call = MagicMock(side_effect=_rate_limit_error())
+
+    with patch("app.core.config.settings.groq_api_key", "real_like_groq_key"):
+        with patch(
+            "app.services.llm.fallback.call_groq_async",
+            side_effect=GroqRequestTooLargeError("too big"),
+        ):
+            with pytest.raises(LLMProvidersExhaustedError) as exc_info:
+                await generate_with_fallback(gemini_call, prompt="p", system_instruction="s")
+
+    message = str(exc_info.value).lower()
+    assert "too large" in message
+    assert "try again later" not in message
+
+
+def test_generate_with_fallback_sync_classifies_too_large_request_distinctly():
+    from app.services.llm.groq_client import GroqRequestTooLargeError
+
+    gemini_call = MagicMock(side_effect=_rate_limit_error())
+
+    with patch("app.core.config.settings.groq_api_key", "real_like_groq_key"):
+        with patch(
+            "app.services.llm.fallback.call_groq_sync",
+            side_effect=GroqRequestTooLargeError("too big"),
+        ):
+            with pytest.raises(LLMProvidersExhaustedError) as exc_info:
+                generate_with_fallback_sync(gemini_call, prompt="p", system_instruction="s")
+
+    message = str(exc_info.value).lower()
+    assert "too large" in message
+    assert "try again later" not in message

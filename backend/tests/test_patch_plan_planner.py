@@ -332,3 +332,26 @@ async def test_plan_patches_without_gemini_key_and_no_hypotheses_is_not_applicab
 
     mock_genai.Client.assert_not_called()
     assert result.status == PatchPlanStatus.NOT_APPLICABLE
+
+
+# ---------------------------------------------------------------------------
+# Prompt-size bounding (Issue #3): see
+# app.services.diagnosis.diagnoser.MAX_RETRIEVED_CONTEXT_CHARS's identical
+# constant for the full rationale (live-measured 16k-44k token unbounded
+# prompts silently defeating the Groq fallback's 8000 TPM cap).
+# ---------------------------------------------------------------------------
+from app.services.patch_plan.planner import MAX_RETRIEVED_CONTEXT_CHARS, _format_retrieved_context
+
+
+def test_format_retrieved_context_truncates_when_over_budget():
+    huge_content = "x" * (MAX_RETRIEVED_CONTEXT_CHARS + 5000)
+    formatted = _format_retrieved_context([_context(content=huge_content)])
+    assert len(formatted) < len(huge_content)
+    assert "truncated" in formatted
+
+
+def test_format_retrieved_context_does_not_truncate_within_budget():
+    small_content = "def add(a, b):\n    return a - b\n"
+    formatted = _format_retrieved_context([_context(content=small_content)])
+    assert "truncated" not in formatted
+    assert small_content in formatted

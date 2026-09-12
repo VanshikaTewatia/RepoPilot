@@ -6,10 +6,12 @@ see ``app.services.embeddings`` for the Gemini-only embedding provider.
 
 from app.services.llm.errors import LLMProvidersExhaustedError, is_gemini_rate_limit_error
 from app.services.llm.fallback import generate_with_fallback, generate_with_fallback_sync
+from app.services.llm.groq_client import GroqRequestTooLargeError
 
 __all__ = [
     "LLMProvidersExhaustedError",
     "is_gemini_rate_limit_error",
     "generate_with_fallback",
     "generate_with_fallback_sync",
+    "GroqRequestTooLargeError",
 ]

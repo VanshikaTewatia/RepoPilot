@@ -44,7 +44,7 @@ from typing import Any, Callable, Optional
 from app.core.config import settings
 from app.core.logging import logger
 from app.services.llm.errors import LLMProvidersExhaustedError, is_gemini_rate_limit_error
-from app.services.llm.groq_client import call_groq_async, call_groq_sync
+from app.services.llm.groq_client import GroqRequestTooLargeError, call_groq_async, call_groq_sync
 
 _NO_FALLBACK_CONFIGURED_MESSAGE = (
     "Gemini's quota/rate limit was exhausted and no fallback provider is "
@@ -54,6 +54,16 @@ _NO_FALLBACK_CONFIGURED_MESSAGE = (
 _BOTH_PROVIDERS_FAILED_MESSAGE = (
     "Gemini's quota/rate limit was exhausted and the Groq fallback provider "
     "also failed to generate a response. Please try again later."
+)
+# Deliberately distinct from _BOTH_PROVIDERS_FAILED_MESSAGE: a request too
+# large for the fallback's rate-limit tier is a structurally different
+# condition from a genuine provider outage or true rate limit -- "try
+# again later" is actively misleading here, since waiting can never help a
+# request that is simply too big; only a smaller/narrower request can.
+_REQUEST_TOO_LARGE_MESSAGE = (
+    "Gemini's quota/rate limit was exhausted, and this request is too large "
+    "for the fallback provider to handle. Try a smaller or more specific "
+    "request."
 )
 
 
@@ -88,7 +98,10 @@ async def generate_with_fallback(
             return await call_groq_async(
                 prompt=prompt, system_instruction=system_instruction, groq_model=groq_model
             )
-        except Exception as groq_exc:  # noqa: BLE001 -- any Groq failure is wrapped, never leaked raw
+        except GroqRequestTooLargeError as groq_exc:
+            logger.warning(f"Groq fallback skipped (request too large): {groq_exc}")
+            raise LLMProvidersExhaustedError(_REQUEST_TOO_LARGE_MESSAGE) from groq_exc
+        except Exception as groq_exc:  # noqa: BLE001 -- any other Groq failure is wrapped, never leaked raw
             logger.error(f"Groq fallback also failed after Gemini quota exhaustion: {groq_exc}")
             raise LLMProvidersExhaustedError(_BOTH_PROVIDERS_FAILED_MESSAGE) from groq_exc
 
@@ -119,6 +132,9 @@ def generate_with_fallback_sync(
             return call_groq_sync(
                 prompt=prompt, system_instruction=system_instruction, groq_model=groq_model
             )
-        except Exception as groq_exc:  # noqa: BLE001 -- any Groq failure is wrapped, never leaked raw
+        except GroqRequestTooLargeError as groq_exc:
+            logger.warning(f"Groq fallback skipped (request too large): {groq_exc}")
+            raise LLMProvidersExhaustedError(_REQUEST_TOO_LARGE_MESSAGE) from groq_exc
+        except Exception as groq_exc:  # noqa: BLE001 -- any other Groq failure is wrapped, never leaked raw
             logger.error(f"Groq fallback also failed after Gemini quota exhaustion: {groq_exc}")
             raise LLMProvidersExhaustedError(_BOTH_PROVIDERS_FAILED_MESSAGE) from groq_exc

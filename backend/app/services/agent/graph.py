@@ -328,6 +328,23 @@ def _format_patch_plan_for_prompt(patch_plan: Dict[str, Any]) -> str:
     return "\n".join(lines) + "\n\n"
 
 
+# Caps the total formatted context embedded in the patch-generation prompt.
+# See app.services.diagnosis.diagnoser.MAX_RETRIEVED_CONTEXT_CHARS's
+# identical constant for the full rationale (live-measured 16k-44k token
+# unbounded prompts silently defeating the Groq fallback's 8000 TPM cap).
+MAX_RETRIEVED_CONTEXT_CHARS = 24000
+
+
+def _bound_output(text: str, limit: int = MAX_RETRIEVED_CONTEXT_CHARS) -> str:
+    """Truncate ``text`` to at most ``limit`` characters, noting how much
+    was cut so context is never silently incomplete -- identical behavior
+    to ``app.services.baseline.executor.bound_output``."""
+    if len(text) <= limit:
+        return text
+    omitted = len(text) - limit
+    return f"{text[:limit]}\n... [truncated, {omitted} more characters]"
+
+
 def _generate_patches_with_gemini(
     task_description: str,
     retrieved_context: List[Dict[str, Any]],
@@ -347,7 +364,15 @@ def _generate_patches_with_gemini(
         total_lines = item.get("total_lines", 0)
         fence_lang = _fence_language_for_path(fpath)
         context_parts.append(f"### File: {fpath} ({total_lines} lines total)\n```{fence_lang}\n{content}\n```")
-    context_str = "\n\n".join(context_parts)
+    # See app.services.diagnosis.diagnoser.MAX_RETRIEVED_CONTEXT_CHARS's
+    # identical constant for the full rationale (live-measured 16k-44k
+    # token unbounded prompts silently defeating the Groq fallback's 8000
+    # TPM cap). Only trims once every file's content already exceeds this
+    # generous a budget combined -- an explicit "[truncated, N more
+    # characters]" marker is left in place of silently cut content so the
+    # model never has to guess whether a file it can't fully see extends
+    # further than what's shown.
+    context_str = _bound_output("\n\n".join(context_parts))
 
     system_instruction = (
         "You are RepoPilot, an expert autonomous software engineer. "
@@ -640,6 +665,15 @@ async def baseline_node(state: AgentState) -> Dict[str, Any]:
     retained verbatim in ``reproduction_spec`` (Phase 5) -- see
     ``post_fix_reproduction_node``, which reruns exactly this after an edit
     is applied, never a newly-planned reproduction.
+
+    When no reproduction is applicable at all (``baseline_status ==
+    "NOT_APPLICABLE"``), also captures a pre-edit run of the workspace's own
+    verification command into ``baseline_test_results`` -- see that field's
+    docstring on ``AgentState`` for why this is the only reliable way to
+    keep NOT_APPLICABLE (deliberately the common, expected response for a
+    perfectly genuine fix, not just a fabricated one) from letting
+    finalize_node claim FIXED on nothing more than "a patch applied and the
+    suite happened to still pass".
     """
     workspace = state["workspace_dir"]
     task_description = state.get("task_description", "")
@@ -669,6 +703,33 @@ async def baseline_node(state: AgentState) -> Dict[str, Any]:
         logger.warning(f"Baseline reproduction integration failed unexpectedly: {e}")
         status, result, detail = "UNABLE_TO_REPRODUCE", None, f"Baseline reproduction failed unexpectedly: {e}"
 
+    baseline_test_results: Optional[Dict[str, Any]] = None
+    if status == "NOT_APPLICABLE":
+        # No LLM-guessed reproduction was applicable -- this is the one
+        # ambiguous case finalize_node cannot otherwise resolve (see
+        # AgentState.baseline_test_results' own docstring for the full
+        # rationale). Reuses the workspace's own already-known verification
+        # command (tools.run_tests_for_task -- the exact call test_node
+        # itself makes later) against the UNTOUCHED, pre-edit workspace, so
+        # finalize_node can require an objective, deterministic fail-before/
+        # pass-after signal instead of trusting NOT_APPLICABLE alone.
+        # Offloaded via asyncio.to_thread exactly like every other blocking
+        # Docker/subprocess call already made from this async node's
+        # siblings (see plan_node's identical rationale) -- baseline_node
+        # itself is async, so a direct blocking call here would freeze the
+        # event loop for every other in-flight request, not just this one.
+        try:
+            baseline_test_results = await asyncio.to_thread(
+                tools.run_tests_for_task,
+                workspace,
+                task_description=task_description,
+                keyword_matches=state.get("keyword_matches"),
+                test_path=state.get("test_target"),
+            )
+        except Exception as e:  # noqa: BLE001 -- this pre-edit probe must never crash the task or be treated as a verdict about the bug
+            logger.warning(f"Pre-edit baseline test snapshot failed unexpectedly: {e}")
+            baseline_test_results = None
+
     message = f"Baseline reproduction: {status} -- {detail}"
     return {
         "status": "baseline_checked",
@@ -676,6 +737,7 @@ async def baseline_node(state: AgentState) -> Dict[str, Any]:
         "baseline_result": result,
         "baseline_detail": detail,
         "reproduction_spec": reproduction_spec,
+        "baseline_test_results": baseline_test_results,
         "messages": state.get("messages", []) + [{"role": "agent", "content": message}],
     }
 
@@ -1209,11 +1271,11 @@ def finalize_node(state: AgentState) -> Dict[str, Any]:
     never ran a real edit pass (e.g. a unit test constructing state by
     hand) sees the same behavior as before this field existed.
 
-    ``baseline_status`` (Phase 4B-3, set by ``baseline_node``) gates ONLY
-    the one branch below that would otherwise claim FIXED -- a passing test
-    suite plus an applied patch is not, by itself, evidence that the
-    *reported* bug ever existed or is now gone; baseline reproduction is
-    evidence gathering, never proof of correctness. Both "UNABLE_TO_REPRODUCE"
+    ``baseline_status`` (Phase 4B-3, set by ``baseline_node``) gates the
+    branches below that would otherwise claim FIXED -- a passing test suite
+    plus an applied patch is not, by itself, evidence that the *reported*
+    bug ever existed or is now gone; baseline reproduction is evidence
+    gathering, never proof of correctness. Both "UNABLE_TO_REPRODUCE"
     and "NOT_REPRODUCED" downgrade this branch to UNABLE_TO_VERIFY -- never
     NO_CHANGE_NEEDED, which specifically (and here, falsely) means "no code
     change was actually made". The two remain distinguishable via
@@ -1222,9 +1284,25 @@ def finalize_node(state: AgentState) -> Dict[str, Any]:
     why NO_CHANGE_NEEDED would misrepresent it. Every other branch
     (NO_CHANGE_NEEDED, FAILED, tooling UNABLE_TO_VERIFY) already means "no
     fix is being claimed" and is left untouched regardless of
-    ``baseline_status`` -- including when it is absent entirely (``None``,
-    e.g. a hand-constructed state, or any task predating this integration),
-    which behaves identically to before this field existed.
+    ``baseline_status``.
+
+    "NOT_APPLICABLE" gets its own dedicated branch (see below) rather than
+    falling through to the generic ``elif is_verified: FIXED`` the way it
+    did before this gate was added: it is the CORRECT, preferred planner
+    response whenever no trustworthy reproduction could be built (see
+    ``app.services.baseline.planner``'s own instructions), which makes it
+    the common, expected outcome for plenty of genuine, simple fixes too --
+    not a signal specific to a fabricated bug. Without an independent
+    signal, a fabricated bug report and a real one with a thin evidence
+    trail are indistinguishable at this point in the state. That signal is
+    ``baseline_test_results`` (also set by ``baseline_node``, only in this
+    exact case): whether a real test in the workspace already failed
+    *before* any edit was made. Only ``None`` (baseline_status absent
+    entirely -- e.g. a hand-constructed state, or any task predating this
+    integration) still falls through to the generic FIXED branch unchanged,
+    exactly as before this field existed; that case cannot arise from a
+    real graph run (``baseline_node`` always executes first, unconditionally,
+    for every task).
 
     ``post_fix_reproduction_status`` (Phase 5, set by
     ``post_fix_reproduction_node``) applies one further, narrower gate: when
@@ -1360,6 +1438,38 @@ def finalize_node(state: AgentState) -> Dict[str, Any]:
                 "failure is gone "
                 f"({state.get('post_fix_reproduction_detail') or 'post-fix reproduction did not run or was inconclusive'}). "
                 "This is not evidence the fix is correct or incorrect."
+            )
+    elif is_verified and baseline_status == "NOT_APPLICABLE":
+        # NOT_APPLICABLE means no LLM-guessed reproduction procedure was
+        # constructed for this claim -- app.services.baseline.planner's own
+        # instructions call this the CORRECT, preferred answer whenever no
+        # trustworthy procedure can be built, which makes it the common,
+        # expected outcome for plenty of genuine, simple fixes too, not a
+        # signal specific to a fabricated bug. baseline_status alone cannot
+        # tell those two cases apart -- both look identical here (a patch
+        # applied, the full suite passing). baseline_test_results (set by
+        # baseline_node only in this exact case -- see its own docstring)
+        # is the deterministic tiebreaker: did a real test already fail
+        # before any edit was made at all. Absent/unavailable pre-edit
+        # results are treated the same as "no failure observed" -- FIXED
+        # must never be granted on missing evidence.
+        baseline_test_res = state.get("baseline_test_results") or {}
+        pre_edit_had_failure = (
+            bool(baseline_test_res.get("available")) and baseline_test_res.get("failed", 0) > 0
+        )
+        if pre_edit_had_failure:
+            outcome = "FIXED"
+            applied_display = applied_count if applied_count is not None else len(patches)
+            detail = f"Applied {applied_display} patch(es) and verification passed."
+        else:
+            outcome = "UNABLE_TO_VERIFY"
+            detail = (
+                "The patch applied and verification passed, but baseline reproduction "
+                "could not construct any evidence-backed procedure for the reported "
+                f"issue ({state.get('baseline_detail') or 'no reproduction was applicable'}), "
+                "and no pre-existing test failure was observed in the workspace before "
+                "the edit either. This does not confirm the reported issue was ever "
+                "real, so it is not reported as a confirmed fix."
             )
     elif is_verified:
         outcome = "FIXED"

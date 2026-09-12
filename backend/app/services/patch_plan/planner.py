@@ -119,6 +119,26 @@ def _format_diagnosis_context(diagnosis: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+# See app.services.diagnosis.diagnoser.MAX_RETRIEVED_CONTEXT_CHARS's
+# identical constant for the full rationale (live-measured 16k-44k token
+# unbounded prompts silently defeating the Groq fallback's 8000 TPM cap).
+# A module-local copy (rather than importing app.services.baseline.
+# bound_output) preserves this module's own "no dependency on
+# reproduction, Docker, workspace creation" design principle (see module
+# docstring).
+MAX_RETRIEVED_CONTEXT_CHARS = 24000
+
+
+def _bound_output(text: str, limit: int = MAX_RETRIEVED_CONTEXT_CHARS) -> str:
+    """Truncate ``text`` to at most ``limit`` characters, noting how much
+    was cut so evidence is never silently incomplete -- identical behavior
+    to ``app.services.baseline.executor.bound_output``."""
+    if len(text) <= limit:
+        return text
+    omitted = len(text) - limit
+    return f"{text[:limit]}\n... [truncated, {omitted} more characters]"
+
+
 def _format_retrieved_context(retrieved_context: List[Dict[str, Any]]) -> str:
     parts: List[str] = []
     for item in retrieved_context:
@@ -126,7 +146,7 @@ def _format_retrieved_context(retrieved_context: List[Dict[str, Any]]) -> str:
         content = item.get("content", "")
         total_lines = item.get("total_lines", 0)
         parts.append(f"### File: {fpath} ({total_lines} lines total)\n```\n{content}\n```")
-    return "\n\n".join(parts)
+    return _bound_output("\n\n".join(parts))
 
 
 def _build_patch_plan_prompt(

@@ -111,6 +111,31 @@ def _format_project_facts(e: Evidence) -> str:
     )
 
 
+# Caps the total formatted evidence embedded in the answer prompt. Live
+# testing against a real, moderately sized repository showed unbounded
+# multi-file/multi-chunk evidence routinely reaching 16,000-44,000 tokens --
+# comfortably within Gemini's own context window, but far past Groq's
+# fallback tier's 8000-tokens-per-minute cap, silently defeating the
+# Gemini->Groq fallback for exactly the substantive Deep Q&A questions it
+# exists to protect. 24000 chars (~6000 tokens at the standard ~4
+# chars/token estimate -- see app.services.embeddings.rate_limiter.
+# estimate_tokens) leaves comfortable headroom under that cap while still
+# covering realistic multi-file evidence; mirrors the identical bounding
+# already applied to investigation_findings in app.services.baseline.
+# planner.MAX_FINDINGS_CHARS.
+MAX_EVIDENCE_CHARS = 24000
+
+
+def _bound_output(text: str, limit: int = MAX_EVIDENCE_CHARS) -> str:
+    """Truncate ``text`` to at most ``limit`` characters, noting how much
+    was cut so evidence is never silently incomplete -- identical behavior
+    to ``app.services.baseline.executor.bound_output``."""
+    if len(text) <= limit:
+        return text
+    omitted = len(text) - limit
+    return f"{text[:limit]}\n... [truncated, {omitted} more characters]"
+
+
 def _format_evidence(evidence_list: List[Evidence]) -> str:
     parts: List[str] = []
     for e in evidence_list:
@@ -132,7 +157,7 @@ def _format_evidence(evidence_list: List[Evidence]) -> str:
             for m in e.symbol_matches:
                 section.append(f"- {m.citation}: {m.content}")
         parts.append("\n".join(section))
-    return "\n\n".join(parts)
+    return _bound_output("\n\n".join(parts))
 
 
 def _build_answer_prompt(question: str, question_class: QuestionClass, evidence_list: List[Evidence]) -> str:

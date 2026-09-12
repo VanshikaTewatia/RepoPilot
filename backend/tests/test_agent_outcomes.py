@@ -159,6 +159,80 @@ def test_finalize_node_unable_to_verify_takes_priority_over_verified_flag():
 
 
 # ---------------------------------------------------------------------------
+# Fabricated-bug protection: NOT_APPLICABLE baseline status is the CORRECT,
+# common response for both a genuine fix (whose evidence-gathering stages
+# just didn't construct a repro) and a fabricated bug report (nothing to
+# construct one from) -- the two are indistinguishable from baseline_status
+# alone. baseline_test_results (a pre-edit run of the workspace's own
+# verification command, set only in this exact case by baseline_node) is
+# the deterministic tiebreaker: a real bug must show at least one test
+# failing before the edit. See app.services.agent.state.AgentState.
+# baseline_test_results and finalize_node's own docstring for the full
+# rationale.
+# ---------------------------------------------------------------------------
+def test_finalize_node_not_applicable_with_pre_edit_failure_is_fixed():
+    """A genuine bug: baseline couldn't construct a reproduction, but the
+    pre-edit snapshot shows the workspace's own test suite really did fail
+    before the edit -- this is real, verifiable evidence, so FIXED stands."""
+    state = {
+        "test_results": {"available": True, "success": True},
+        "proposed_patches": [{"file_path": "a.py", "code": "x = 1\n"}],
+        "is_verified": True,
+        "baseline_status": "NOT_APPLICABLE",
+        "baseline_test_results": {"available": True, "failed": 1, "passed": 3},
+    }
+    out = finalize_node(state)
+    assert out["outcome"] == "FIXED"
+
+
+def test_finalize_node_not_applicable_without_pre_edit_failure_is_unable_to_verify():
+    """A fabricated bug: baseline couldn't construct a reproduction, and the
+    pre-edit snapshot shows the full suite was ALREADY passing before any
+    edit -- nothing was ever observed to be broken, so a patch that
+    happens to apply and a suite that happens to still pass must NEVER be
+    reported as FIXED."""
+    state = {
+        "test_results": {"available": True, "success": True},
+        "proposed_patches": [{"file_path": "a.py", "code": "x = 1\n"}],
+        "is_verified": True,
+        "baseline_status": "NOT_APPLICABLE",
+        "baseline_test_results": {"available": True, "failed": 0, "passed": 4},
+    }
+    out = finalize_node(state)
+    assert out["outcome"] == "UNABLE_TO_VERIFY"
+    assert "not confirmed" in out["outcome_detail"].lower() or "not reported as a confirmed fix" in out["outcome_detail"]
+
+
+def test_finalize_node_not_applicable_with_missing_pre_edit_results_is_unable_to_verify():
+    """The pre-edit probe itself failed/never ran (baseline_test_results is
+    None) -- missing evidence must never be treated as permission to claim
+    FIXED, only as more reason not to."""
+    state = {
+        "test_results": {"available": True, "success": True},
+        "proposed_patches": [{"file_path": "a.py", "code": "x = 1\n"}],
+        "is_verified": True,
+        "baseline_status": "NOT_APPLICABLE",
+        "baseline_test_results": None,
+    }
+    out = finalize_node(state)
+    assert out["outcome"] == "UNABLE_TO_VERIFY"
+
+
+def test_finalize_node_baseline_status_none_preserves_prior_behavior():
+    """baseline_status absent entirely (None) is unreachable from a real
+    graph run (baseline_node always executes first, unconditionally) --
+    kept behaving exactly as it did before this gate existed, for
+    hand-constructed states / tasks predating this integration."""
+    state = {
+        "test_results": {"available": True, "success": True},
+        "proposed_patches": [{"file_path": "a.py", "code": "x = 1\n"}],
+        "is_verified": True,
+    }
+    out = finalize_node(state)
+    assert out["outcome"] == "FIXED"
+
+
+# ---------------------------------------------------------------------------
 # Task #31 regression: a Node install-phase environment failure must
 # terminate after ONE attempt as UNABLE_TO_VERIFY, never burn the full
 # retry budget generating pointless patches against a broken environment
@@ -332,6 +406,73 @@ async def test_outcome_fixed_when_bug_confirmed_and_patch_verified():
         assert final_state["is_verified"] is True
         assert len(final_state["proposed_patches"]) == 1
         assert "return a + b" in code_file.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Full graph, end-to-end: a FABRICATED bug (the code is already correct,
+# there is no pre-existing test failure anywhere) must never reach FIXED
+# even when diagnosis/patch-plan/patch-generation are all unusually
+# "helpful" and produce a plausible-looking (but unnecessary) patch --
+# exactly the real failure mode this fix closes. Distinct from
+# test_outcome_no_change_needed_when_claimed_bug_already_fixed above: that
+# test relies on the mocked patch-generation call itself returning zero
+# patches; THIS test forces a patch to be generated and applied anyway, to
+# prove the new baseline_test_results gate -- not the "no patches
+# generated" gate -- is what stops the false FIXED claim here.
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_outcome_unable_to_verify_when_bug_is_fabricated_but_llm_still_proposes_a_patch():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        workspace = Path(tmpdir)
+        code_file = workspace / "calc.py"
+        # Genuinely correct code -- nothing is broken, and the task's claim
+        # (a crash on negative numbers) is false: add() never raises for
+        # any numeric input.
+        code_file.write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+        (workspace / "test_calc.py").write_text(
+            "from calc import add\ndef test_add():\n    assert add(2, 3) == 5\n",
+            encoding="utf-8",
+        )
+
+        # An unusually "helpful" LLM invents unnecessary defensive code for
+        # a claim that was never real -- still applies cleanly and the
+        # (unrelated, already-passing) test suite still passes afterward.
+        mock_response = MagicMock()
+        mock_response.text = json.dumps([
+            {
+                "file_path": "calc.py",
+                "code": (
+                    "def add(a, b):\n"
+                    "    if a < 0 or b < 0:\n"
+                    "        raise ValueError('negative numbers not supported')\n"
+                    "    return a + b\n"
+                ),
+                "start_line": 1,
+                "end_line": 2,
+            }
+        ])
+        mock_client = MagicMock()
+        mock_client.models.generate_content.side_effect = [
+            _not_applicable_baseline_response(),
+            _no_evidence_diagnosis_response(),
+            _planned_patch_plan_response(),
+            mock_response,
+        ]
+
+        initial_state = _base_state(
+            workspace, "add() in calc.py crashes when given negative numbers."
+        )
+
+        with patch("app.core.config.settings.gemini_api_key", "real_like_test_key_12345"):
+            with patch("google.genai.Client", return_value=mock_client):
+                final_state = await agent_app.ainvoke(initial_state)
+
+        assert final_state["outcome"] == "UNABLE_TO_VERIFY"
+        assert final_state["is_verified"] is True
+        assert final_state["baseline_status"] == "NOT_APPLICABLE"
+        # The pre-edit snapshot must show the ORIGINAL (unmodified) file
+        # never had a failing test to begin with.
+        assert final_state["baseline_test_results"]["failed"] == 0
 
 
 # ---------------------------------------------------------------------------
