@@ -84,6 +84,38 @@ _INSTALL_FAILED_SENTINEL = "REPOPILOT_INSTALL_FAILED"
 # (below) because the exit code alone is provably unreliable here.
 _INSTALL_LIED_ABOUT_SUCCESS_MARKER = "npm error Exit handler never called"
 
+# Phase 8 / Task #31: literal, fixed markers the verification script itself
+# echoes immediately before starting each phase -- never anything parsed out
+# of a project's own install/test tool output, which varies by tool and
+# version and would be fragile to match. Read back (via container.logs(),
+# now fetched even after a timeout -- see _execute_in_docker) to tell a
+# timeout that happened while dependencies were still being installed apart
+# from one that happened during the project's own test run, without
+# guessing at ecosystem-specific output.
+_PHASE_INSTALL_MARKER = "REPOPILOT_PHASE:install"
+_PHASE_TEST_MARKER = "REPOPILOT_PHASE:test"
+
+# Emitted onto the returned output (alongside the ordinary timeout message)
+# ONLY when a Docker wait() timeout is positively confirmed -- via the phase
+# markers above -- to have happened while the dependency-install step was
+# still running: an environment/dependency-preparation failure, not a
+# verdict on the reported issue (see Task #31: npm ci retried DNS lookups
+# under network_mode="none" for ~75s, well past the 45s verification
+# timeout, and was misclassified as an ordinary failing test). Never emitted
+# for a timeout during the test phase, and never emitted/guessed when no
+# phase marker was observed at all -- see _execute_in_docker's timeout
+# handling, which treats both of those as an ordinary, still-retryable
+# timeout exactly as before this fix.
+_TIMEOUT_DURING_INSTALL_SENTINEL = "REPOPILOT_TIMEOUT_DURING_INSTALL"
+
+
+def _timed_out_during_install(output: str) -> bool:
+    """True only when a Docker wait() timeout was positively confirmed (via
+    phase markers) to have happened while the dependency-install step was
+    still running. Never true for a timeout during the test phase, and
+    never guessed when no phase marker was observed at all."""
+    return _TIMEOUT_DURING_INSTALL_SENTINEL in output
+
 
 def _extract_missing_toolchain(output: str) -> Optional[str]:
     """Return the missing tool's name if our own preflight check reported
@@ -109,6 +141,15 @@ def _install_failed(output: str) -> bool:
 # ecosystem, without the engine needing to know which tool wants what.
 _CONTAINER_ENV: Dict[str, str] = {
     "HOME": "/tmp",
+    # Widely-respected, generic convention (Jest/CRA/Mocha/Cypress and many
+    # other tools across ecosystems all check this) for "running
+    # non-interactively" -- e.g. it's what keeps `react-scripts test`
+    # (CRA's default Jest wrapper) from launching interactive watch mode,
+    # which would otherwise never terminate inside a non-TTY container.
+    # Deliberately generic rather than a framework-specific flag (e.g.
+    # `--watchAll=false`) since RepoPilot has no reliable way to know which
+    # test framework a given project's "test" script actually invokes.
+    "CI": "1",
     "NPM_CONFIG_CACHE": "/tmp/.npm-cache",
     "GOCACHE": "/tmp/.cache/go-build",
     "GOPATH": "/tmp/go",
@@ -458,6 +499,59 @@ class VerificationEngine:
                 # own environment).
                 install_argv = None
 
+        # Phase 8 (Task #31): Node dependency installation moves the same
+        # direction as Python's above, but NOT via a host subprocess --
+        # `npm ci`/`install` (and pnpm/yarn's equivalents) run arbitrary
+        # repository-declared lifecycle scripts (preinstall/install/
+        # postinstall) for the top-level package AND every transitive
+        # dependency, a far more commonly-abused supply-chain vector than
+        # Python's sdist build step, so running it directly on the backend
+        # host (even into an isolated --target directory) was rejected.
+        # Instead this uses a second, throwaway, network-ENABLED Docker
+        # container (the one deliberate exception to network_mode="none" in
+        # this codebase, scoped to exactly this step) with lifecycle
+        # scripts explicitly disabled via --ignore-scripts (see
+        # NodeAdapter.dependency_prep_command) -- see
+        # _prepare_node_deps_isolated for the full security boundary. Only
+        # engaged when Docker itself is available (this step launches its
+        # own container); when Docker is unavailable, Node keeps its
+        # existing, unchanged subprocess fallback further down (running
+        # install_argv as before -- a pre-existing, unrelated code path).
+        if adapter.ecosystem == "node" and install_argv and self._docker_runner.is_docker_available:
+            host_deps_dir, host_install_log = self._prepare_node_deps_isolated(workspace, adapter)
+            if host_deps_dir is None:
+                duration = time.time() - start_time
+                detail = (
+                    "Node dependencies could not be prepared ahead of verification "
+                    "(the isolated, network-enabled dependency-preparation container "
+                    "failed), so Node verification could not be run. This is not "
+                    "evidence that the reported issue does or does not exist."
+                )
+                logger.warning(
+                    f"Isolated Node dependency preparation failed at {workspace}: {detail}"
+                )
+                return VerificationResult(
+                    ecosystem=adapter.ecosystem,
+                    success=False,
+                    exit_code=1,
+                    output=host_install_log,
+                    passed=0,
+                    failed=0,
+                    duration=round(duration, 2),
+                    available=False,
+                    manifests_found=manifests_found,
+                    detail=detail,
+                    command=" ".join(test_argv),
+                ).to_dict()
+            node_modules_dir = Path(host_deps_dir) / "node_modules"
+            if node_modules_dir.is_dir():
+                extra_volumes = {str(node_modules_dir): {"bind": "/workspace/node_modules", "mode": "ro"}}
+            # No extra_env needed here (unlike Python's PYTHONPATH above) --
+            # Node module resolution just walks up from cwd looking for a
+            # node_modules directory, so mounting it directly at
+            # /workspace/node_modules is sufficient on its own.
+            install_argv = None
+
         try:
             if self._docker_runner.is_docker_available:
                 output, exit_code = self._execute_in_docker(
@@ -486,6 +580,38 @@ class VerificationEngine:
                 "This is not evidence that the reported issue does or does not exist."
             )
             logger.warning(f"Verification tool missing for {adapter.ecosystem} at {workspace}: {detail}")
+            return VerificationResult(
+                ecosystem=adapter.ecosystem,
+                success=False,
+                exit_code=exit_code,
+                output=output,
+                passed=0,
+                failed=0,
+                duration=round(duration, 2),
+                available=False,
+                manifests_found=manifests_found,
+                detail=detail,
+                command=" ".join(test_argv),
+            ).to_dict()
+
+        if _timed_out_during_install(output):
+            # Task #31: a Docker wait() timeout confirmed (via phase
+            # markers, see _execute_in_docker) to have happened while
+            # dependency installation was still running -- an environment/
+            # tooling failure, never a verdict on the reported issue.
+            # Positively confirmed only; a timeout during the test phase, or
+            # with no phase marker observed at all, does not reach here (see
+            # _execute_in_docker's own conservative classification).
+            detail = (
+                f"Dependency installation had not finished when the {self.timeout}s "
+                f"verification timeout was reached, so {adapter.ecosystem} verification "
+                "could not be run. This is an environment/tooling problem, not evidence "
+                "that the reported issue does or does not exist."
+            )
+            logger.warning(
+                f"Verification timed out during dependency installation for "
+                f"{adapter.ecosystem} at {workspace}: {detail}"
+            )
             return VerificationResult(
                 ecosystem=adapter.ecosystem,
                 success=False,
@@ -597,11 +723,20 @@ class VerificationEngine:
         dependencies via a read-only mount and ``PYTHONPATH`` -- both
         default to ``None``, identical to omitting them, so no other
         ecosystem's call is affected.
+
+        Phase 8 (Task #31): the script echoes ``_PHASE_INSTALL_MARKER``/
+        ``_PHASE_TEST_MARKER`` immediately before each phase starts, so a
+        ``Container.wait(timeout=...)`` timeout can be told apart -- "still
+        installing dependencies" vs. "the project's own test command is
+        running" -- from whatever the container had actually flushed by the
+        time it was killed, without ever parsing the install/test tool's own
+        (ecosystem-specific, version-dependent) output.
         """
         effective_timeout = timeout if timeout is not None else self.timeout
         script_parts = [_preflight_snippet(test_argv[0])]
         if install_argv:
             install_cmd = " ".join(install_argv)
+            script_parts.append(f'echo "{_PHASE_INSTALL_MARKER}"')
             script_parts.append(
                 f'{install_cmd} >/tmp/.repopilot-install.log 2>&1; ec=$?; '
                 f'cat /tmp/.repopilot-install.log; '
@@ -610,6 +745,7 @@ class VerificationEngine:
                 f'echo "{_INSTALL_FAILED_SENTINEL}" >&2; exit 1; '
                 f'fi'
             )
+        script_parts.append(f'echo "{_PHASE_TEST_MARKER}"')
         script_parts.append('"$@"')
         script = "; ".join(script_parts)
         cmd = ["sh", "-c", script, "sh"] + test_argv
@@ -641,11 +777,43 @@ class VerificationEngine:
                 logger.warning(
                     f"Docker verification run exceeded {effective_timeout}s timeout; killing container."
                 )
+                # Phase 8 (Task #31): always retrieve whatever the container
+                # had actually flushed before being killed -- previously
+                # discarded entirely, which made a timeout during dependency
+                # installation indistinguishable from one during the
+                # project's own test run. container.logs() works on a
+                # running/just-killed container the same as a finished one.
+                partial_output = ""
+                try:
+                    raw = container.logs(stdout=True, stderr=True)
+                    partial_output = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+                except (DockerException, APIError):
+                    pass
                 try:
                     container.kill()
                 except (DockerException, APIError):
                     pass
-                return f"Verification timed out after {effective_timeout} seconds.", 124
+
+                timeout_msg = f"Verification timed out after {effective_timeout} seconds."
+                output = f"{partial_output}\n\n{timeout_msg}".strip() if partial_output else timeout_msg
+
+                saw_install_marker = _PHASE_INSTALL_MARKER in partial_output
+                saw_test_marker = _PHASE_TEST_MARKER in partial_output
+                if install_argv and saw_install_marker and not saw_test_marker:
+                    # Positively confirmed: the container was still inside
+                    # the dependency-install step when the timeout fired --
+                    # an environment/dependency-preparation failure, not
+                    # evidence about the reported issue. _run_adapter
+                    # classifies this as available=False via
+                    # _TIMEOUT_DURING_INSTALL_SENTINEL.
+                    output = f"{output}\n{_TIMEOUT_DURING_INSTALL_SENTINEL}"
+                # Every other case -- no install step existed, the test
+                # phase had already started (a slow/hanging test command --
+                # never automatically an environment failure), or no phase
+                # marker was observed at all (e.g. logs hadn't flushed in
+                # time) -- is left as an ordinary, still-retryable timeout
+                # exactly as before this fix. Never guessed at.
+                return output, 124
 
             exit_code = wait_result.get("StatusCode", 1)
             raw = container.logs(stdout=True, stderr=True)
@@ -725,6 +893,144 @@ class VerificationEngine:
         except Exception as e:
             shutil.rmtree(target_dir, ignore_errors=True)
             return None, f"Host-side dependency installation error: {e}"
+
+    def _prepare_node_deps_isolated(
+        self, workspace: Path, adapter: VerificationAdapter
+    ) -> Tuple[Optional[str], str]:
+        """Install a Node project's OWN declared dependencies inside a
+        throwaway, network-ENABLED Docker container -- never on the
+        RepoPilot backend host, and never inside the network-isolated
+        verification container itself (Phase 8 / Task #31).
+
+        This is deliberately NOT a Node port of
+        ``_install_python_deps_isolated`` above: ``npm ci``/``install`` (and
+        pnpm/yarn's equivalents) can run arbitrary repository-controlled
+        lifecycle scripts (``preinstall``/``install``/``postinstall``) for
+        the top-level package AND every transitive dependency -- a far more
+        commonly-abused supply-chain vector than Python's sdist build step
+        (most PyPI packages today ship prebuilt wheels, sidestepping
+        arbitrary code at install time far more often than npm does).
+        Running that directly on the backend host, even into an isolated
+        ``--target`` directory, would let any untrusted repository's
+        dependency tree execute code with this process's own privileges --
+        ruled out for exactly that reason.
+
+        The security boundary here is instead a second, ephemeral
+        container:
+          - Uses the SAME fixed, adapter-declared image verification itself
+            uses (``adapter.docker_image``) -- never a repository-influenced
+            or otherwise dynamic image name.
+          - Gets Docker's *default* bridged network (network_mode is simply
+            omitted below) -- the one deliberate, narrowly-scoped exception
+            to ``network_mode="none"`` anywhere in this codebase, needed
+            because dependency resolution genuinely requires reaching the
+            package registry. The actual verification container that runs
+            the project's own test command is completely unaffected and
+            stays network-isolated exactly as before (see ``_run_adapter``,
+            which sets this container's *output* -- a read-only
+            ``node_modules`` mount -- as the ONLY thing that crosses back
+            into that network-isolated run).
+          - Mounts ONLY a fresh, empty temp directory containing a COPY of
+            ``package.json``/the lockfile -- never the real workspace being
+            verified, never any other host path, and deliberately never a
+            repository-provided ``.npmrc`` (which could redirect the
+            registry or otherwise reconfigure npm).
+          - Never mounts the Docker socket and is never run privileged.
+          - Runs as the same unprivileged ``uid:gid`` as every other
+            sandbox container.
+          - Gets no backend credentials/secrets: ``environment`` here is the
+            same generic ``_CONTAINER_ENV`` (HOME/npm cache location) every
+            other ecosystem's container already receives -- nothing else.
+          - Forces lifecycle scripts off via
+            ``adapter.dependency_prep_command()`` (``--ignore-scripts``),
+            so nothing the repository declares as a dependency ever gets to
+            execute code here even with real network access. A package that
+            genuinely needs a postinstall step (e.g. a native binary
+            download) may legitimately fail to install under this
+            constraint -- that is an accepted, honest "could not verify"
+            outcome, not something this method works around.
+          - Is bounded by its own timeout (``_INSTALL_TIMEOUT_SECONDS``),
+            entirely separate from the 45s verification budget.
+
+        Returns ``(staging_dir, log)``. ``staging_dir`` is ``None`` when the
+        preparation itself failed, timed out, or errored -- the caller
+        treats that as an environment/setup failure (``available=False``),
+        exactly like a Python dependency-install failure; retrying
+        identically would fail identically. On success, ``staging_dir`` may
+        or may not contain a populated ``node_modules`` (a project with zero
+        real dependencies legitimately produces none) -- the caller checks
+        for that directory's existence before mounting anything. The caller
+        is responsible for removing ``staging_dir`` once the run it served
+        has finished.
+        """
+        prep_cmd = adapter.dependency_prep_command(workspace)
+        if not prep_cmd:
+            return None, "No dependency preparation command available for this Node project."
+
+        staging_dir = tempfile.mkdtemp(prefix="repopilot_nodedeps_")
+        for manifest in ("package.json", "pnpm-lock.yaml", "yarn.lock", "package-lock.json"):
+            src = workspace / manifest
+            if src.is_file():
+                shutil.copy2(src, Path(staging_dir) / manifest)
+
+        script = f'{_preflight_snippet(prep_cmd[0])}; {" ".join(prep_cmd)}'
+        cmd = ["sh", "-c", script]
+
+        container = None
+        try:
+            container = self._docker_runner._docker_client.containers.run(
+                image=adapter.docker_image,
+                command=cmd,
+                working_dir="/deps",
+                volumes={staging_dir: {"bind": "/deps", "mode": "rw"}},
+                environment=dict(_CONTAINER_ENV),
+                # network_mode intentionally omitted -- Docker's default
+                # bridged (outbound-only) network, never the host network,
+                # never the Docker socket. See the docstring above.
+                nano_cpus=int(settings.sandbox_max_cpu * 1e9),
+                mem_limit=f"{settings.sandbox_max_memory_mb}m",
+                detach=True,
+                user="1000:1000",
+            )
+            try:
+                wait_result = container.wait(timeout=_INSTALL_TIMEOUT_SECONDS)
+            except _DOCKER_WAIT_TIMEOUT_EXCEPTIONS:
+                try:
+                    container.kill()
+                except (DockerException, APIError):
+                    pass
+                shutil.rmtree(staging_dir, ignore_errors=True)
+                return None, (
+                    f"Node dependency preparation timed out after "
+                    f"{_INSTALL_TIMEOUT_SECONDS}s in the isolated, network-enabled "
+                    "preparation container."
+                )
+
+            exit_code = wait_result.get("StatusCode", 1)
+            raw = container.logs(stdout=True, stderr=True)
+            log = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+        except (DockerException, APIError) as e:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            return None, f"Node dependency preparation container error: {e}"
+        finally:
+            if container is not None:
+                try:
+                    container.remove(force=True)
+                except (DockerException, APIError):
+                    pass
+
+        missing_tool = _extract_missing_toolchain(log)
+        if missing_tool:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            return None, (
+                f"Required tool '{missing_tool}' is not available for Node dependency "
+                f"preparation.\n{log}"
+            )
+        if exit_code != 0:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            return None, log
+
+        return staging_dir, log
 
     def _execute_in_subprocess(
         self,

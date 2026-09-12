@@ -27,6 +27,7 @@ from app.services.baseline import (
 from app.services.verification.project_analyzer import ProjectInfo, RepositoryAnalyzer, select_relevant_projects
 from app.services.diagnosis import diagnose, DiagnosisStatus
 from app.services.agent.db import open_session
+from app.services.llm.fallback import generate_with_fallback_sync
 from app.services.rag.retriever import CodeRetriever, RetrievalError, RetrievedChunk
 from app.services.patch_plan import plan_patches, PatchPlanStatus
 
@@ -393,12 +394,22 @@ def _generate_patches_with_gemini(
     try:
         from google import genai
         client = genai.Client(api_key=settings.gemini_api_key)
-        response = client.models.generate_content(
-            model=settings.gemini_model_name,
-            contents=prompt,
-            config={"system_instruction": system_instruction},
+        # This function is itself synchronous and is always invoked via the
+        # caller's own asyncio.to_thread offload (see plan_node below), so
+        # calling generate_with_fallback_sync (which may make a genuinely
+        # blocking Groq call) here never touches the main event loop. Falls
+        # back to Groq only on a recognized Gemini 429/RESOURCE_EXHAUSTED
+        # quota error; any other failure propagates to the except below
+        # exactly as before.
+        raw_text = generate_with_fallback_sync(
+            lambda: client.models.generate_content(
+                model=settings.gemini_model_name,
+                contents=prompt,
+                config={"system_instruction": system_instruction},
+            ),
+            prompt=prompt,
+            system_instruction=system_instruction,
         )
-        raw_text = response.text or ""
         return parse_and_validate_patches(raw_text, workspace_dir=workspace_dir)
     except Exception as e:
         logger.error(f"Error generating patches with Gemini: {e}")

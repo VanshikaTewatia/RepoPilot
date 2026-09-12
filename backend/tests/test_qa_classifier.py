@@ -254,3 +254,54 @@ async def test_successful_classification_user_asserted_tech_is_not_overwritten(r
 
     assert result.classification_failed is False
     assert result.user_asserted_tech == ["React", "some-made-up-framework"]
+
+
+# ---------------------------------------------------------------------------
+# LLM provider fallback (Deep Q&A shares app.services.llm.fallback with the
+# rest of the codebase -- see app/services/llm/ -- so classify_question
+# falls back to Groq for free on a recognized Gemini quota error).
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_classify_question_falls_back_to_groq_on_gemini_quota_error(real_looking_key, monkeypatch):
+    from types import SimpleNamespace
+
+    from google.genai.errors import ClientError
+
+    quota_error = ClientError(
+        429, {"error": {"status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}, SimpleNamespace(headers={})
+    )
+    mock_client = MagicMock()
+    mock_client.models.generate_content.side_effect = quota_error
+
+    monkeypatch.setattr(settings, "groq_api_key", "real_like_groq_key")
+    payload = {
+        "kind": "lookup", "depth": "shallow",
+        "subject_terms": ["cart"], "user_asserted_tech": [], "likely_multi_file": False,
+    }
+
+    with patch("app.services.qa.classifier.genai.Client", return_value=mock_client):
+        with patch(
+            "app.services.llm.fallback.call_groq_async", return_value=json.dumps(payload)
+        ) as mock_groq:
+            result = await classify_question("Where is the cart subtotal calculated?")
+
+    mock_groq.assert_called_once()
+    assert result.classification_failed is False
+    assert result.kind == "lookup"
+
+
+@pytest.mark.asyncio
+async def test_classify_question_ordinary_gemini_failure_never_calls_groq(real_looking_key, monkeypatch):
+    mock_client = MagicMock()
+    mock_client.models.generate_content.side_effect = RuntimeError("network unreachable")
+    monkeypatch.setattr(settings, "groq_api_key", "real_like_groq_key")
+
+    with patch("app.services.qa.classifier.genai.Client", return_value=mock_client):
+        with patch("app.services.llm.fallback.call_groq_async") as mock_groq:
+            result = await classify_question("Where is the cart subtotal calculated?")
+
+    mock_groq.assert_not_called()
+    # Unchanged existing behavior: any non-rate-limit failure degrades to
+    # the safe FALLBACK_DEPTH classification.
+    assert result.classification_failed is True
+    assert result.depth == FALLBACK_DEPTH

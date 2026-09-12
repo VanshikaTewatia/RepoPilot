@@ -28,7 +28,6 @@ itself a diff, never passed to edit_node/apply_patch.
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any, Dict, List, Optional, Set
 
 from google import genai
@@ -36,6 +35,7 @@ from google import genai
 from app.core.config import settings
 from app.core.logging import logger
 from app.services.diagnosis.models import DiagnosisStatus
+from app.services.llm.fallback import generate_with_fallback
 from app.services.qa.json_utils import parse_json_object
 from app.services.qa.models import CitationRef
 
@@ -260,14 +260,17 @@ async def plan_patches(
             # see app.services.diagnosis.diagnoser.diagnose's identical
             # comment for the full rationale (mirrors
             # app.services.embeddings.gemini's existing asyncio.to_thread
-            # use).
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model=settings.gemini_model_name,
-                contents=prompt,
-                config={"system_instruction": _PATCH_PLAN_SYSTEM_INSTRUCTION},
+            # use). Falls back to Groq only on a recognized Gemini 429/
+            # RESOURCE_EXHAUSTED quota error.
+            raw_text = await generate_with_fallback(
+                lambda: client.models.generate_content(
+                    model=settings.gemini_model_name,
+                    contents=prompt,
+                    config={"system_instruction": _PATCH_PLAN_SYSTEM_INSTRUCTION},
+                ),
+                prompt=prompt,
+                system_instruction=_PATCH_PLAN_SYSTEM_INSTRUCTION,
             )
-            raw_text = response.text or ""
             data = parse_json_object(raw_text)
             if not isinstance(data, dict):
                 raise ValueError(f"Expected a JSON object, got {type(data).__name__}")

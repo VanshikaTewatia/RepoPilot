@@ -315,3 +315,57 @@ async def test_gemini_exception_degrades_safely(real_looking_key):
 
     assert answer.confidence == "inferred"
     assert "quota exceeded" in answer.summary
+
+
+# ---------------------------------------------------------------------------
+# LLM provider fallback (Deep Q&A shares app.services.llm.fallback -- see
+# app/services/llm/ -- so generate_answer falls back to Groq for free on a
+# recognized Gemini quota error, without any answerer-specific fallback code).
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_generate_answer_falls_back_to_groq_on_gemini_quota_error(real_looking_key, monkeypatch):
+    from types import SimpleNamespace
+
+    from google.genai.errors import ClientError
+
+    evidence = [_evidence(chunks=[_chunk("src/cart.py", "subtotal"), _chunk("src/cart.py", "total")])]
+    quota_error = ClientError(
+        429, {"error": {"status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}, SimpleNamespace(headers={})
+    )
+    mock_client = MagicMock()
+    mock_client.models.generate_content.side_effect = quota_error
+
+    monkeypatch.setattr(settings, "groq_api_key", "real_like_groq_key")
+    payload = {
+        "summary": "Answered via Groq fallback.",
+        "confidence": "direct_evidence",
+        "evidence": [{"file_path": "src/cart.py", "start_line": 1, "end_line": 5, "symbol_name": "subtotal"}],
+    }
+
+    with patch("app.services.qa.answerer.genai.Client", return_value=mock_client):
+        with patch(
+            "app.services.llm.fallback.call_groq_async", return_value=json.dumps(payload)
+        ) as mock_groq:
+            answer = await generate_answer("Where is subtotal calculated?", _qclass(), evidence)
+
+    mock_groq.assert_called_once()
+    assert answer.summary == "Answered via Groq fallback."
+    assert answer.confidence == "direct_evidence"
+
+
+@pytest.mark.asyncio
+async def test_generate_answer_ordinary_gemini_failure_never_calls_groq(real_looking_key, monkeypatch):
+    """Unchanged existing behavior (test_gemini_exception_degrades_safely,
+    above) plus an explicit proof Groq is never invoked for a generic
+    (non-rate-limit) failure."""
+    evidence = [_evidence(chunks=[_chunk("src/cart.py", "subtotal")])]
+    mock_client = MagicMock()
+    mock_client.models.generate_content.side_effect = RuntimeError("network unreachable")
+    monkeypatch.setattr(settings, "groq_api_key", "real_like_groq_key")
+
+    with patch("app.services.qa.answerer.genai.Client", return_value=mock_client):
+        with patch("app.services.llm.fallback.call_groq_async") as mock_groq:
+            answer = await generate_answer("Where is subtotal calculated?", _qclass(), evidence)
+
+    mock_groq.assert_not_called()
+    assert answer.confidence == "inferred"

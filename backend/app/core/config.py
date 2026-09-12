@@ -104,6 +104,36 @@ class Settings(BaseSettings):
     )
 
     # -------------------------------------------------------------------------
+    # LLM Provider Fallback (generation only -- embeddings stay Gemini-only)
+    # -------------------------------------------------------------------------
+    primary_llm_provider: str = Field(
+        default="gemini",
+        description="Primary text-generation provider used by every agent/Deep-Q&A Gemini call site",
+    )
+    fallback_llm_provider: str = Field(
+        default="groq",
+        description="Text-generation provider used only when the primary provider fails with a "
+        "recognized quota/rate-limit error (429 / RESOURCE_EXHAUSTED)",
+    )
+    groq_api_key: str = Field(
+        default="",
+        description="Groq API key used only as the generation fallback when Gemini is rate-limited; "
+        "never used for embeddings",
+    )
+    groq_model_name: str = Field(
+        default="openai/gpt-oss-120b",
+        description="Groq chat-completions model used for fallback generation",
+    )
+    groq_api_base_url: str = Field(
+        default="https://api.groq.com/openai/v1",
+        description="Groq OpenAI-compatible API base URL (overridable in tests)",
+    )
+    groq_timeout_seconds: float = Field(
+        default=30.0,
+        description="Request timeout in seconds for a Groq fallback generation call",
+    )
+
+    # -------------------------------------------------------------------------
     # Database (PostgreSQL 16 + pgvector)
     # -------------------------------------------------------------------------
     database_url: str = Field(

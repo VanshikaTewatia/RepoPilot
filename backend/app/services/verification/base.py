@@ -105,3 +105,13 @@ class VerificationAdapter(ABC):
     def unavailable_reason(self, workspace: Path) -> Optional[str]:
         """Human-readable reason test_command() returned None. Override when relevant."""
         return None
+
+    def dependency_prep_command(self, workspace: Path) -> Optional[List[str]]:
+        """Argv for an isolated, network-enabled dependency-preparation step,
+        distinct from install_command() -- for ecosystems whose dependency
+        installation needs real network access but must never run inside the
+        network-isolated verification container or directly on the RepoPilot
+        backend host (see NodeAdapter and
+        VerificationEngine._prepare_node_deps_isolated). Returns None by
+        default; only overridden where such a step exists."""
+        return None

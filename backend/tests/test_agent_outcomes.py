@@ -159,6 +159,67 @@ def test_finalize_node_unable_to_verify_takes_priority_over_verified_flag():
 
 
 # ---------------------------------------------------------------------------
+# Task #31 regression: a Node install-phase environment failure must
+# terminate after ONE attempt as UNABLE_TO_VERIFY, never burn the full
+# retry budget generating pointless patches against a broken environment
+# (the original Task #31 run made 3 fruitless attempts before reporting a
+# misleading FAILED).
+# ---------------------------------------------------------------------------
+def test_task_31_node_install_phase_timeout_stops_after_one_attempt_as_unable_to_verify():
+    """End-to-end regression: a real Node repository verified under
+    network_mode="none" whose isolated dependency-preparation container
+    times out must be classified by VerificationEngine as available=False;
+    should_continue() must stop immediately (never reach analyze_failure /
+    consume the remaining retry budget); and finalize_node() must report
+    UNABLE_TO_VERIFY -- never FAILED after exhausting max_attempts."""
+    from requests.exceptions import ReadTimeout
+
+    from app.services.agent.graph import should_continue
+    from app.services.verification.engine import VerificationEngine
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        (root / "package.json").write_text(
+            json.dumps({"scripts": {"test": "react-scripts test"}}), encoding="utf-8"
+        )
+        (root / "package-lock.json").write_text("", encoding="utf-8")
+
+        # Simulates the isolated Node dependency-preparation container
+        # itself timing out (e.g. a genuinely unreachable registry) --
+        # _prepare_node_deps_isolated's own timeout handling returns None
+        # unconditionally in that case, no phase marker needed.
+        fake_container = MagicMock()
+        fake_container.wait.side_effect = ReadTimeout("timed out")
+        fake_container.logs.return_value = b""
+        fake_docker_client = MagicMock()
+        fake_docker_client.containers.run.return_value = fake_container
+
+        engine = VerificationEngine(network_mode="none")
+        with patch.object(type(engine._docker_runner), "is_docker_available", True):
+            engine._docker_runner._docker_client = fake_docker_client
+            test_results = engine.verify(root)
+
+        assert test_results["ecosystem"] == "node"
+        assert test_results["available"] is False  # dependency prep never finished
+
+        state = {
+            "test_results": test_results,
+            "proposed_patches": [],
+            "is_verified": False,
+            "attempt_count": 1,
+            "max_attempts": 3,
+        }
+
+        # Must stop immediately -- never route to analyze_failure, never
+        # consume the remaining 2 attempts.
+        assert should_continue(state) == "failed"
+
+        out = finalize_node(state)
+        assert out["outcome"] == "UNABLE_TO_VERIFY"
+        assert state["attempt_count"] == 1  # attempt budget was never touched
+
+
+# ---------------------------------------------------------------------------
 # Full graph: reported bug already fixed / cannot be substantiated -> NO_CHANGE_NEEDED
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio

@@ -16,7 +16,6 @@ later verify (or correct) against real repository evidence -- this module
 never validates it, never uses it to decide what actually exists.
 """
 
-import asyncio
 from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
@@ -25,6 +24,7 @@ from google import genai
 
 from app.core.config import settings
 from app.core.logging import logger
+from app.services.llm.fallback import generate_with_fallback
 from app.services.qa.investigator import VALID_DEPTHS, _question_terms
 from app.services.qa.json_utils import parse_json_object
 
@@ -213,19 +213,24 @@ async def classify_question(question: str) -> QuestionClass:
 
     try:
         client = genai.Client(api_key=settings.gemini_api_key)
+        prompt = _build_classifier_prompt(question)
         # Phase 7: offload the blocking SDK call to a worker thread. This
         # function is awaited directly from the /api/v1/qa/ask route handler
         # (not the agent graph) -- without this, a real Gemini call here
         # would freeze the entire FastAPI process for every other in-flight
         # request too, not just this one. Mirrors
         # app.services.embeddings.gemini's existing asyncio.to_thread use.
-        response = await asyncio.to_thread(
-            client.models.generate_content,
-            model=settings.gemini_model_name,
-            contents=_build_classifier_prompt(question),
-            config={"system_instruction": _CLASSIFIER_SYSTEM_INSTRUCTION},
+        # Falls back to Groq only on a recognized Gemini 429/RESOURCE_EXHAUSTED
+        # quota error.
+        raw_text = await generate_with_fallback(
+            lambda: client.models.generate_content(
+                model=settings.gemini_model_name,
+                contents=prompt,
+                config={"system_instruction": _CLASSIFIER_SYSTEM_INSTRUCTION},
+            ),
+            prompt=prompt,
+            system_instruction=_CLASSIFIER_SYSTEM_INSTRUCTION,
         )
-        raw_text = response.text or ""
         data = parse_json_object(raw_text)
         if not isinstance(data, dict):
             raise ValueError(f"Expected a JSON object, got {type(data).__name__}")

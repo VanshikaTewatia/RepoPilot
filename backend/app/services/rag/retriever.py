@@ -1,6 +1,5 @@
 """Code-aware semantic retrieval and RAG question answering."""
 
-import asyncio
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 from sqlalchemy import select
@@ -11,6 +10,7 @@ from app.core.config import settings
 from app.core.logging import logger
 from app.db.models.code_chunk import CodeChunk
 from app.services.embeddings.gemini import GeminiEmbeddingProvider
+from app.services.llm.fallback import generate_with_fallback
 
 
 class RetrievalError(RuntimeError):
@@ -179,14 +179,17 @@ class CodeRetriever:
                 # /api/v1/rag/ask route handler, so a real Gemini call here
                 # would otherwise freeze the entire FastAPI process. Mirrors
                 # app.services.embeddings.gemini's existing asyncio.to_thread
-                # use.
-                response = await asyncio.to_thread(
-                    client.models.generate_content,
-                    model=settings.gemini_model_name,
-                    contents=prompt,
-                    config={"system_instruction": system_instruction},
+                # use. Falls back to Groq only on a recognized Gemini 429/
+                # RESOURCE_EXHAUSTED quota error.
+                answer_text = await generate_with_fallback(
+                    lambda: client.models.generate_content(
+                        model=settings.gemini_model_name,
+                        contents=prompt,
+                        config={"system_instruction": system_instruction},
+                    ),
+                    prompt=prompt,
+                    system_instruction=system_instruction,
                 )
-                answer_text = response.text or ""
             else:
                 # Simulated answer in test environment
                 citations_preview = ", ".join(c.citation for c in chunks)

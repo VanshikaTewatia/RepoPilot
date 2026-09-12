@@ -69,6 +69,22 @@ class NodeAdapter(VerificationAdapter):
             return ["npm", "ci"] if (workspace / "package-lock.json").is_file() else ["npm", "install"]
         return [manager, "install"]
 
+    def dependency_prep_command(self, workspace: Path) -> Optional[List[str]]:
+        """Argv for the isolated, network-enabled dependency-preparation
+        container (see VerificationEngine._prepare_node_deps_isolated) --
+        same package-manager selection as install_command() above, with
+        lifecycle scripts explicitly disabled. This is the one step in the
+        whole verification pipeline that gets real network access, so it
+        must never let a repository's own preinstall/install/postinstall
+        hooks -- declared by the top-level package OR any transitive
+        dependency -- execute; --ignore-scripts is what enforces that, not
+        network/filesystem isolation alone.
+        """
+        base = self.install_command(workspace)
+        if not base:
+            return None
+        return base + ["--ignore-scripts"]
+
     def test_command(self, workspace: Path, test_path: Optional[str] = None) -> Optional[List[str]]:
         manager = self.package_manager(workspace)
         scripts = self._read_scripts(workspace)

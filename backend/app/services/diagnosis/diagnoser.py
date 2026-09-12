@@ -27,13 +27,13 @@ exactly like ``_generate_patches_with_gemini`` already does.
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any, Dict, List, Optional, Set
 
 from google import genai
 
 from app.core.config import settings
 from app.core.logging import logger
+from app.services.llm.fallback import generate_with_fallback
 from app.services.qa.json_utils import parse_json_object
 from app.services.qa.models import CitationRef
 
@@ -206,13 +206,18 @@ async def diagnose(
             # of asyncio.to_thread) so a slow Gemini response never blocks
             # this process's single event loop, which also serves unrelated
             # FastAPI requests while diagnose_node runs in the background.
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model=settings.gemini_model_name,
-                contents=prompt,
-                config={"system_instruction": _DIAGNOSIS_SYSTEM_INSTRUCTION},
+            # A recognized Gemini 429/RESOURCE_EXHAUSTED quota error falls
+            # back to Groq automatically; any other failure propagates below
+            # exactly as before.
+            raw_text = await generate_with_fallback(
+                lambda: client.models.generate_content(
+                    model=settings.gemini_model_name,
+                    contents=prompt,
+                    config={"system_instruction": _DIAGNOSIS_SYSTEM_INSTRUCTION},
+                ),
+                prompt=prompt,
+                system_instruction=_DIAGNOSIS_SYSTEM_INSTRUCTION,
             )
-            raw_text = response.text or ""
             data = parse_json_object(raw_text)
             if not isinstance(data, dict):
                 raise ValueError(f"Expected a JSON object, got {type(data).__name__}")

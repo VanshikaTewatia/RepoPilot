@@ -26,13 +26,13 @@ Never fabricates:
     if it were a confident architectural fact.
 """
 
-import asyncio
 from typing import List, Set
 
 from google import genai
 
 from app.core.config import settings
 from app.core.logging import logger
+from app.services.llm.fallback import generate_with_fallback
 from app.services.qa.classifier import QuestionClass
 from app.services.qa.investigator import Evidence
 from app.services.qa.json_utils import parse_json_object
@@ -240,14 +240,17 @@ async def generate_answer(
             # route handler, so without this a real Gemini call here would
             # freeze the entire FastAPI process. See
             # app.services.qa.classifier.classify_question's identical
-            # comment.
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model=settings.gemini_model_name,
-                contents=prompt,
-                config={"system_instruction": _ANSWER_SYSTEM_INSTRUCTION},
+            # comment. Falls back to Groq only on a recognized Gemini 429/
+            # RESOURCE_EXHAUSTED quota error.
+            raw_text = await generate_with_fallback(
+                lambda: client.models.generate_content(
+                    model=settings.gemini_model_name,
+                    contents=prompt,
+                    config={"system_instruction": _ANSWER_SYSTEM_INSTRUCTION},
+                ),
+                prompt=prompt,
+                system_instruction=_ANSWER_SYSTEM_INSTRUCTION,
             )
-            raw_text = response.text or ""
             data = parse_json_object(raw_text)
             if not isinstance(data, dict):
                 raise ValueError(f"Expected a JSON object, got {type(data).__name__}")

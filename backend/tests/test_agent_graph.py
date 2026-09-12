@@ -857,6 +857,65 @@ def test_patch_prompt_fence_language_covers_multiple_ecosystems_and_unknown_fall
 
 
 # ===========================================================================
+# LLM provider fallback: _generate_patches_with_gemini falls back to Groq
+# only on a recognized Gemini 429/RESOURCE_EXHAUSTED quota error, and stays
+# a plain synchronous function (called via the caller's own
+# asyncio.to_thread, exactly as before -- see app.services.llm.fallback).
+# ===========================================================================
+def test_generate_patches_falls_back_to_groq_on_gemini_quota_error():
+    from types import SimpleNamespace
+
+    from google.genai.errors import ClientError
+
+    quota_error = ClientError(
+        429, {"error": {"status": "RESOURCE_EXHAUSTED", "message": "Quota exceeded"}}, SimpleNamespace(headers={})
+    )
+    mock_client = MagicMock()
+    mock_client.models.generate_content.side_effect = quota_error
+
+    groq_text = json.dumps(
+        [{"file_path": "src/order_service.py", "code": "return 1\n", "start_line": 1, "end_line": 1}]
+    )
+
+    with patch("app.core.config.settings.gemini_api_key", "real_like_test_key_12345"):
+        with patch("app.core.config.settings.groq_api_key", "real_like_groq_key"):
+            with patch("google.genai.Client", return_value=mock_client):
+                with patch(
+                    "app.services.llm.fallback.call_groq_sync", return_value=groq_text
+                ) as mock_groq:
+                    patches = _generate_patches_with_gemini(
+                        task_description="Fix VIP discount calculation",
+                        retrieved_context=[
+                            {"file_path": "src/order_service.py", "content": "def f():\n    pass\n", "total_lines": 50}
+                        ],
+                    )
+
+    mock_groq.assert_called_once()
+    assert len(patches) == 1
+    assert patches[0]["file_path"] == "src/order_service.py"
+
+
+def test_generate_patches_ordinary_gemini_failure_never_calls_groq():
+    mock_client = MagicMock()
+    mock_client.models.generate_content.side_effect = RuntimeError("network unreachable")
+
+    with patch("app.core.config.settings.gemini_api_key", "real_like_test_key_12345"):
+        with patch("app.core.config.settings.groq_api_key", "real_like_groq_key"):
+            with patch("google.genai.Client", return_value=mock_client):
+                with patch("app.services.llm.fallback.call_groq_sync") as mock_groq:
+                    patches = _generate_patches_with_gemini(
+                        task_description="Fix VIP discount calculation",
+                        retrieved_context=[
+                            {"file_path": "src/order_service.py", "content": "def f():\n    pass\n", "total_lines": 50}
+                        ],
+                    )
+
+    mock_groq.assert_not_called()
+    # Unchanged existing behavior: any failure degrades to an empty patch list.
+    assert patches == []
+
+
+# ===========================================================================
 # Phase 7: should_continue -- a confirmed environment/tooling failure must
 # never burn the retry budget; a genuine test failure must retry exactly as
 # before.
@@ -931,6 +990,50 @@ def test_should_continue_is_verified_wins_over_everything_else():
         "test_results": {"available": False},
     }
     assert should_continue(state) == "human_approval"
+
+
+# ===========================================================================
+# Phase 8 (Task #31): a Docker timeout confirmed (via phase markers) to have
+# happened during the project's own TEST execution -- not dependency
+# installation -- must never be auto-classified as an environment failure,
+# so existing retry semantics are completely unaffected.
+# ===========================================================================
+def test_docker_test_phase_timeout_preserves_normal_retry_behavior():
+    """VerificationEngine.verify() against a real (Docker-client-mocked)
+    timeout that happened after the REPOPILOT_PHASE:test marker had already
+    printed must still produce available=True -- so should_continue keeps
+    retrying with budget remaining, exactly like any other genuine test
+    failure/timeout would, both before and after the Task #31 fix."""
+    from requests.exceptions import ReadTimeout
+
+    from app.services.verification.engine import VerificationEngine
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        (root / "go.mod").write_text("module example.com/app\n", encoding="utf-8")
+
+        fake_container = MagicMock()
+        fake_container.wait.side_effect = ReadTimeout("timed out")
+        fake_container.logs.return_value = (
+            b"REPOPILOT_PHASE:install\ngo: downloaded\nREPOPILOT_PHASE:test\n=== RUN TestSlow\n"
+        )
+        fake_docker_client = MagicMock()
+        fake_docker_client.containers.run.return_value = fake_container
+
+        engine = VerificationEngine(network_mode="none")
+        with patch.object(type(engine._docker_runner), "is_docker_available", True):
+            engine._docker_runner._docker_client = fake_docker_client
+            test_results = engine.verify(root)
+
+        assert test_results["available"] is True
+
+        state = {
+            "is_verified": False,
+            "attempt_count": 1,
+            "max_attempts": 3,
+            "test_results": test_results,
+        }
+        assert should_continue(state) == "analyze_failure"
 
 
 # ===========================================================================
