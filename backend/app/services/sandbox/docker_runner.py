@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tomllib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -47,16 +48,59 @@ _GLOBAL_DOCKER_DISABLED = False
 _DEPENDENCY_INSTALL_TIMEOUT_SECONDS = 120
 
 
+def _pyproject_has_dependencies(workspace: Path) -> bool:
+    """True if pyproject.toml declares at least one PEP 621 runtime
+    dependency (a non-empty [project].dependencies list).
+
+    A pyproject.toml with no declared dependencies has nothing for
+    `pip install .` to install -- building the project itself as an
+    installable package is unnecessary just to run its own tests via
+    pytest, and the build can fail for structural reasons (e.g. a flat
+    layout with multiple top-level modules and no explicit package/module
+    list -- setuptools then refuses to guess and aborts) that have nothing
+    to do with whether the reported issue can actually be verified.
+
+    Deliberately narrow, matching what a bare `pip install .` (no extras
+    specifier) actually installs: [project.optional-dependencies] (extras)
+    are NOT installed by this command as written, so they're not checked
+    here -- checking them would misclassify a project as "needs install"
+    for dependencies the existing install command wouldn't even pull in.
+    [build-system].requires is a PEP 517 *build-time* requirement (handled
+    automatically by pip's own build isolation for any package it builds)
+    and is unrelated to whether the project declares application/test
+    dependencies -- never consulted here either.
+    """
+    pyproject_path = workspace / "pyproject.toml"
+    try:
+        with pyproject_path.open("rb") as f:
+            data = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        # Malformed/unreadable pyproject.toml -- fail open to the previous,
+        # safe-by-default behavior (attempt the install; a real failure is
+        # still reported honestly via the existing install-failure path,
+        # never silently skipped without a reason).
+        return True
+    dependencies = (data.get("project") or {}).get("dependencies") or []
+    return bool(dependencies)
+
+
 def _detect_dependency_install_args(workspace: Path) -> Optional[List[str]]:
     """Return pip install arguments for the repo's dependency manifest, if any.
 
     Covers the two common cases (a plain requirements.txt, or an installable
     package via pyproject.toml/setup.py). Repos using other package managers
     (poetry.lock-only, Pipenv, etc.) are not covered by this best-effort step.
+
+    A pyproject.toml alone does not imply an install is needed -- see
+    _pyproject_has_dependencies. setup.py-only projects keep the original,
+    more conservative behavior (always attempt install) since their
+    dependencies can't be determined without executing the file.
     """
     if (workspace / "requirements.txt").is_file():
         return ["-r", "requirements.txt"]
-    if (workspace / "pyproject.toml").is_file() or (workspace / "setup.py").is_file():
+    if (workspace / "setup.py").is_file():
+        return ["."]
+    if (workspace / "pyproject.toml").is_file() and _pyproject_has_dependencies(workspace):
         return ["."]
     return None
 

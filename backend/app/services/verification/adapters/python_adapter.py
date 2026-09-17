@@ -17,6 +17,7 @@ import re
 from pathlib import Path
 from typing import ClassVar, Dict, List, Optional
 
+from app.services.sandbox.docker_runner import _pyproject_has_dependencies
 from app.services.verification.base import VerificationAdapter
 
 
@@ -41,9 +42,16 @@ class PythonAdapter(VerificationAdapter):
         return any(workspace.rglob("test_*.py")) or any(workspace.rglob("*_test.py"))
 
     def install_command(self, workspace: Path) -> Optional[List[str]]:
+        """A pyproject.toml alone does not imply an install is needed -- see
+        app.services.sandbox.docker_runner._pyproject_has_dependencies.
+        setup.py-only projects keep the original, more conservative
+        behavior (always attempt install) since their dependencies can't
+        be determined without executing the file."""
         if (workspace / "requirements.txt").is_file():
             return ["pip", "install", "-r", "requirements.txt"]
-        if (workspace / "pyproject.toml").is_file() or (workspace / "setup.py").is_file():
+        if (workspace / "setup.py").is_file():
+            return ["pip", "install", "."]
+        if (workspace / "pyproject.toml").is_file() and _pyproject_has_dependencies(workspace):
             return ["pip", "install", "."]
         return None
 

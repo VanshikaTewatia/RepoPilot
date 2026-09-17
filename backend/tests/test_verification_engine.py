@@ -9,6 +9,7 @@ execution is exercised via `subprocess.run` patched with `unittest.mock`.
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -355,7 +356,7 @@ def test_verify_python_project_with_dependencies_installs_isolated_and_mounts_re
     network is needed inside the network_mode="none" container at all."""
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)
-        _write(root, "pyproject.toml", "[project]\nname='x'\ndependencies=[]\n")
+        _write(root, "pyproject.toml", "[project]\nname='x'\ndependencies=['requests']\n")
         _write(root, "test_math.py", "def test_add(): assert 1 + 1 == 2\n")
 
         engine = VerificationEngine()
@@ -383,6 +384,63 @@ def test_verify_python_project_with_dependencies_installs_isolated_and_mounts_re
         assert kwargs["extra_env"] == {"PYTHONPATH": "/repopilot-deps"}
         (mount_path,) = kwargs["extra_volumes"].keys()
         assert kwargs["extra_volumes"][mount_path]["mode"] == "ro"
+
+
+def test_verify_python_project_without_dependencies_skips_install_and_runs_pytest_for_real():
+    """Regression test (Phase 6 real-repo end-to-end validation): a
+    pyproject.toml with no declared [project].dependencies -- the exact
+    shape of the real disposable GitHub fixture used for that validation
+    (name/version plus only a [build-system] table, flat two-file layout,
+    no [tool.setuptools] package/module config) -- must never trigger
+    `pip install .`. Before the fix, this repo's own pyproject.toml alone
+    was treated as sufficient reason to install it as a package, and the
+    build failed with setuptools' "Multiple top-level modules discovered
+    in a flat-layout" safety check -- deterministically, regardless of
+    whether the reported bug was actually fixed, which meant verification
+    could never succeed against it.
+
+    Uses the real subprocess.run (wrapped, not replaced) so this proves
+    pytest genuinely executed and produced a real result, not merely that
+    no exception was raised.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        _write(
+            root,
+            "pyproject.toml",
+            "[project]\n"
+            "name = 'calc-fixture'\n"
+            "version = '0.1.0'\n"
+            "\n"
+            "[build-system]\n"
+            "requires = ['setuptools']\n"
+            "build-backend = 'setuptools.build_meta'\n",
+        )
+        _write(root, "calculator.py", "def calculate_total(price, quantity):\n    return price + quantity\n")
+        _write(
+            root,
+            "test_calculator.py",
+            "from calculator import calculate_total\n\n\ndef test_calculate_total():\n    assert calculate_total(10, 3) == 13\n",
+        )
+
+        engine = VerificationEngine()
+        engine._docker_runner._docker_checked = True
+        engine._docker_runner._docker_available = False
+
+        with patch("app.services.verification.engine.subprocess.run", wraps=subprocess.run) as spy_run:
+            result = engine.verify(root)
+
+        assert result["ecosystem"] == "python"
+        assert result["available"] is True
+        assert result["success"] is True
+        assert result["passed"] == 1
+        assert result["failed"] == 0
+
+        # No isolated pip-install was ever attempted -- only the real
+        # pytest invocation itself.
+        install_calls = [c for c in spy_run.call_args_list if "--target" in c.args[0]]
+        assert install_calls == []
+        assert spy_run.call_count == 1
 
 
 def test_verify_python_project_isolated_install_failure_is_unable_to_verify_not_failed():

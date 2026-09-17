@@ -94,10 +94,50 @@ def test_detect_dependency_install_args_requirements_txt():
         assert _detect_dependency_install_args(workspace) == ["-r", "requirements.txt"]
 
 
-def test_detect_dependency_install_args_pyproject_toml():
+def test_detect_dependency_install_args_pyproject_toml_with_dependencies():
+    """A pyproject.toml that genuinely declares runtime dependencies still
+    triggers an install -- this is the case _pyproject_has_dependencies
+    must preserve."""
     with tempfile.TemporaryDirectory() as tmpdir:
         workspace = Path(tmpdir)
-        (workspace / "pyproject.toml").write_text("[project]\nname = 'x'\n", encoding="utf-8")
+        (workspace / "pyproject.toml").write_text(
+            "[project]\nname = 'x'\ndependencies = ['requests']\n", encoding="utf-8"
+        )
+        assert _detect_dependency_install_args(workspace) == ["."]
+
+
+def test_detect_dependency_install_args_pyproject_toml_without_dependencies():
+    """Regression test (Phase 6 real-repo validation): a pyproject.toml
+    that exists but declares no [project].dependencies must NOT trigger
+    `pip install .` -- there is nothing to install, and for a flat-layout
+    project (no explicit package/module list) the build itself can fail
+    with setuptools' "Multiple top-level modules discovered" safety check,
+    unrelated to whether the reported issue can actually be verified.
+    Matches the exact shape of the real disposable GitHub fixture repo
+    used for end-to-end validation (calc-fixture): name/version plus only
+    a [build-system] table, no declared dependencies."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        workspace = Path(tmpdir)
+        (workspace / "pyproject.toml").write_text(
+            "[project]\n"
+            "name = 'calc-fixture'\n"
+            "version = '0.1.0'\n"
+            "\n"
+            "[build-system]\n"
+            "requires = ['setuptools']\n"
+            "build-backend = 'setuptools.build_meta'\n",
+            encoding="utf-8",
+        )
+        assert _detect_dependency_install_args(workspace) is None
+
+
+def test_detect_dependency_install_args_pyproject_toml_malformed_fails_open():
+    """An unparseable pyproject.toml falls back to the previous,
+    safe-by-default behavior (attempt the install) rather than silently
+    skipping it without a reason."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        workspace = Path(tmpdir)
+        (workspace / "pyproject.toml").write_text("not valid toml [[[", encoding="utf-8")
         assert _detect_dependency_install_args(workspace) == ["."]
 
 

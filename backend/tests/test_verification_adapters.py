@@ -35,12 +35,22 @@ class TestPythonAdapter:
 
             assert PythonAdapter().install_command(root) == ["pip", "install", "-r", "requirements.txt"]
 
-    def test_install_command_falls_back_to_pyproject(self):
+    def test_install_command_installs_when_pyproject_declares_dependencies(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _write(root, "pyproject.toml", "[project]\nname='x'\ndependencies=['requests']\n")
+
+            assert PythonAdapter().install_command(root) == ["pip", "install", "."]
+
+    def test_install_command_none_when_pyproject_has_no_dependencies(self):
+        """Regression test (Phase 6 real-repo validation): a pyproject.toml
+        with no declared [project].dependencies must not trigger an
+        install -- see docker_runner._pyproject_has_dependencies for why."""
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             _write(root, "pyproject.toml", "[project]\nname='x'\n")
 
-            assert PythonAdapter().install_command(root) == ["pip", "install", "."]
+            assert PythonAdapter().install_command(root) is None
 
     def test_install_command_none_when_no_manifest(self):
         with tempfile.TemporaryDirectory() as tmpdir:
