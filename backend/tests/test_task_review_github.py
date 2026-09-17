@@ -21,9 +21,14 @@ from fastapi import HTTPException
 from app.core.config import settings
 from app.db.models.repository import Repository
 from app.db.models.task import Task
+from app.db.models.user import User
 from app.services.git_service import GitService
 from app.services.github_service import GitHubError
 from app.services.workspace_manager import WorkspaceManager
+
+# Phase 2: approve_task_fix/reject_task_fix now require an authenticated
+# current_user, checked against the task's repository owner.
+_OWNER = User(id=1, email="owner@example.com", hashed_password="x")
 
 PASSING_TEST_RESULT = {
     "success": True, "exit_code": 0, "output": "1 passed", "passed": 1, "failed": 0, "duration": 0.1,
@@ -82,6 +87,7 @@ def _build_github_review_state(root: Path):
         local_path=str(source),
         remote_url="https://github.com/acme/gh_repo",
         default_branch=default_branch,
+        user_id=_OWNER.id,
     )
     assert "+VALUE = 42" in patch_text
     return source, workspace, task, repo_obj, default_branch
@@ -124,7 +130,7 @@ async def test_approve_github_repo_creates_branch_commits_pushes_and_opens_pr():
                  "app.api.v1.agent.GitHubService.create_pull_request",
                  return_value={"url": "https://github.com/acme/gh_repo/pull/7", "number": 7},
              ) as mock_pr:
-            result = await approve_task_fix(1, db)
+            result = await approve_task_fix(1, db, _OWNER)
 
         assert result["status"] == "approved"
         assert result["pr_url"] == "https://github.com/acme/gh_repo/pull/7"
@@ -155,6 +161,55 @@ async def test_approve_github_repo_creates_branch_commits_pushes_and_opens_pr():
 
 
 @pytest.mark.asyncio
+async def test_approve_github_repo_commit_excludes_build_and_egg_info_artifacts():
+    """Regression test (Phase 6C): _approve_github_task's final verification
+    pass runs directly against repo.local_path (not the isolated task
+    workspace) -- if it leaves build/*.egg-info behind, exactly as a real
+    `pip install --target X .` would (see
+    app.services.verification.engine._install_python_deps_isolated),
+    commit_all's own pruning must keep them out of the pushed commit."""
+    from app.api.v1.agent import approve_task_fix
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        source, workspace, task, repo_obj, default_branch = _build_github_review_state(root)
+        db = _make_db(task=task, repo=repo_obj)
+
+        def _run_tests_leaving_build_artifacts(repo_path, test_path):
+            # Simulate exactly what a real pip install --target X . leaves
+            # behind in repo.local_path during final verification.
+            build_pkg = Path(repo_path) / "build" / "lib" / "src"
+            build_pkg.mkdir(parents=True, exist_ok=True)
+            (build_pkg / "app.py").write_text("VALUE = 42\n", encoding="utf-8")
+            egg_info = Path(repo_path) / "gh_repo.egg-info"
+            egg_info.mkdir(exist_ok=True)
+            (egg_info / "PKG-INFO").write_text("Metadata-Version: 2.1\n", encoding="utf-8")
+            (egg_info / "SOURCES.txt").write_text("setup.py\n", encoding="utf-8")
+            return PASSING_TEST_RESULT
+
+        with patch.object(settings, "workspace_dir", root / "workspaces"), \
+             patch.object(settings, "github_token", "fake-token"), \
+             patch("app.api.v1.agent.tools.run_tests", side_effect=_run_tests_leaving_build_artifacts), \
+             patch("app.api.v1.agent.GitHubService.push_branch") as mock_push, \
+             patch(
+                 "app.api.v1.agent.GitHubService.create_pull_request",
+                 return_value={"url": "https://github.com/acme/gh_repo/pull/9", "number": 9},
+             ):
+            result = await approve_task_fix(1, db, _OWNER)
+
+        assert result["status"] == "approved"
+
+        with git.Repo(source) as gr:
+            gr.git.checkout("repopilot/task-1")
+            committed_files = gr.git.ls_files().splitlines()
+            assert not any("build" in f or "egg-info" in f for f in committed_files)
+            assert (source / "src" / "app.py").read_text(encoding="utf-8") == "VALUE = 42\n"
+            assert not (source / "build").exists()
+            assert not (source / "gh_repo.egg-info").exists()
+            gr.git.checkout(default_branch)
+
+
+@pytest.mark.asyncio
 async def test_approve_github_repo_final_verification_failure_rolls_back():
     from app.api.v1.agent import approve_task_fix
 
@@ -168,7 +223,7 @@ async def test_approve_github_repo_final_verification_failure_rolls_back():
              patch("app.api.v1.agent.tools.run_tests", return_value=FAILING_TEST_RESULT), \
              patch("app.api.v1.agent.GitHubService.push_branch") as mock_push:
             with pytest.raises(HTTPException) as exc_info:
-                await approve_task_fix(1, db)
+                await approve_task_fix(1, db, _OWNER)
 
         assert exc_info.value.status_code == 502
         assert task.status == "approval_failed"
@@ -202,7 +257,7 @@ async def test_approve_github_repo_push_failure_rolls_back_and_scrubs_token():
                  side_effect=GitHubError("simulated push failure"),
              ):
             with pytest.raises(HTTPException) as exc_info:
-                await approve_task_fix(1, db)
+                await approve_task_fix(1, db, _OWNER)
 
         assert exc_info.value.status_code == 502
         assert "simulated push failure" in exc_info.value.detail
@@ -236,7 +291,7 @@ async def test_approve_github_repo_allows_retry_from_approval_failed_status():
                  "app.api.v1.agent.GitHubService.create_pull_request",
                  return_value={"url": "https://github.com/acme/gh_repo/pull/9", "number": 9},
              ):
-            result = await approve_task_fix(1, db)
+            result = await approve_task_fix(1, db, _OWNER)
 
         assert result["status"] == "approved"
         assert task.status == "approved"
@@ -268,13 +323,13 @@ async def test_approve_local_repo_still_uses_direct_apply_no_branch_or_pr():
             changed_files=GitService.get_changed_files(workspace),
             workspace_path=str(workspace),
         )
-        repo_obj = Repository(id=1, name="local_repo", local_path=str(source), remote_url=None)
+        repo_obj = Repository(id=1, name="local_repo", local_path=str(source), remote_url=None, user_id=_OWNER.id)
         db = _make_db(task=task, repo=repo_obj)
 
         with patch.object(settings, "workspace_dir", root / "workspaces"), \
              patch("app.api.v1.agent.GitHubService.push_branch") as mock_push, \
              patch("app.api.v1.agent.GitHubService.create_pull_request") as mock_pr:
-            result = await approve_task_fix(1, db)
+            result = await approve_task_fix(1, db, _OWNER)
 
         assert result["status"] == "approved"
         assert result.get("pr_url") is None
@@ -298,7 +353,7 @@ async def test_reject_github_repo_never_branches_or_pushes():
 
         with patch.object(settings, "workspace_dir", root / "workspaces"), \
              patch("app.api.v1.agent.GitHubService.push_branch") as mock_push:
-            result = await reject_task_fix(1, db)
+            result = await reject_task_fix(1, db, _OWNER)
 
         assert result["status"] == "rejected"
         assert task.status == "rejected"

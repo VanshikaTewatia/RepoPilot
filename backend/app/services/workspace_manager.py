@@ -56,12 +56,20 @@ EXCLUDED_FILE_PATTERNS: Set[str] = {
 
 # Patterns written into every workspace .gitignore before its baseline commit so
 # runtime-generated Python/test artifacts (e.g. bytecode written by pytest inside
-# the sandbox) can never be staged into the task's persisted review diff.
+# the sandbox, or build/*.egg-info left behind by `pip install --target X .` in
+# app.services.verification.engine._install_python_deps_isolated) can never be
+# staged into the task's persisted review diff. Complements (does not replace)
+# GitService's own physical pruning -- see ARTIFACT_DIR_NAMES/ARTIFACT_DIR_PATTERNS
+# there for why both layers exist.
 WORKSPACE_GITIGNORE_PATTERNS: List[str] = [
     "__pycache__/",
     "*.pyc",
     ".pytest_cache/",
     ".coverage",
+    "build/",
+    "dist/",
+    "*.egg-info/",
+    ".eggs/",
 ]
 
 

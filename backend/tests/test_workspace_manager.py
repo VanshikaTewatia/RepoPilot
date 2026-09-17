@@ -11,8 +11,13 @@ import pytest
 
 from app.core.config import settings
 from app.db.models.repository import Repository
+from app.db.models.subscription import Subscription
+from app.db.models.user import User
 from app.services.git_service import GitService
 from app.services.workspace_manager import WorkspaceManager
+
+# Phase 2: create_and_run_task now requires an authenticated current_user.
+_OWNER = User(id=1, email="owner@example.com", hashed_password="x")
 
 EXCLUDED_JUNK_DIRS = {"__pycache__", "node_modules", ".venv", ".pytest_cache"}
 
@@ -201,7 +206,7 @@ async def test_agent_execution_receives_isolated_workspace():
     with tempfile.TemporaryDirectory() as tmpdir:
         root = Path(tmpdir)
         source = _make_source_repo(root)
-        repo_obj = Repository(id=1, name="source_repo", local_path=str(source))
+        repo_obj = Repository(id=1, name="source_repo", local_path=str(source), user_id=_OWNER.id)
 
         captured = {}
 
@@ -223,10 +228,22 @@ async def test_agent_execution_receives_isolated_workspace():
                 }
             }
 
-        exec_result = MagicMock()
-        exec_result.scalar_one_or_none.return_value = repo_obj
+        async def fake_execute(stmt):
+            res = MagicMock()
+            entity = stmt.column_descriptions[0]["entity"]
+            if entity is Repository:
+                res.scalar_one_or_none.return_value = repo_obj
+            elif entity is Subscription:
+                # Phase 5: check_task_limit's subscription lookup -- no row,
+                # so the free-plan path is used (still well under its cap).
+                res.scalar_one_or_none.return_value = None
+            else:
+                # Phase 5: check_task_limit's usage-count query.
+                res.scalar_one.return_value = 0
+            return res
+
         db = MagicMock()
-        db.execute = AsyncMock(return_value=exec_result)
+        db.execute = AsyncMock(side_effect=fake_execute)
         db.add = MagicMock()
         db.commit = AsyncMock()
 
@@ -268,7 +285,7 @@ async def test_agent_execution_receives_isolated_workspace():
             with patch("app.api.v1.agent.agent_app", SimpleNamespace(astream=fake_astream)), patch(
                 "app.api.v1.agent.AsyncSessionLocal", session_local
             ):
-                result = await create_and_run_task(payload, db, background_tasks)
+                result = await create_and_run_task(payload, db, background_tasks, _OWNER)
                 # Phase 6F: execution now happens in the background -- run
                 # the scheduled task now, exactly as Starlette would after
                 # sending the response, so this test can still observe the
@@ -305,7 +322,10 @@ def test_workspace_gitignore_created_and_committed():
         gitignore = workspace / ".gitignore"
         assert gitignore.is_file()
         content = gitignore.read_text(encoding="utf-8")
-        for pattern in ("__pycache__/", "*.pyc", ".pytest_cache/", ".coverage"):
+        for pattern in (
+            "__pycache__/", "*.pyc", ".pytest_cache/", ".coverage",
+            "build/", "dist/", "*.egg-info/", ".eggs/",
+        ):
             assert pattern in content
 
         # The .gitignore is tracked in the single baseline commit, so it never
@@ -350,6 +370,52 @@ def test_runtime_artifacts_cannot_enter_review_diff():
 
         diff = GitService.get_workspace_diff(workspace)
         for banned in ("__pycache__", ".pyc", ".pytest_cache", ".coverage"):
+            assert banned not in diff, f"artifact '{banned}' leaked into diff"
+        assert "-VALUE = 1" in diff
+        assert "+VALUE = 42" in diff
+
+
+# -------------------------------------------------------------------------
+# 9. Phase 6C: build/*.egg-info from an isolated `pip install --target X .`
+# cannot enter the review diff either, via the full WorkspaceManager ->
+# GitService pipeline.
+# -------------------------------------------------------------------------
+def test_python_build_artifacts_cannot_enter_review_diff():
+    """Regression test: build/ and *.egg-info left behind by an isolated
+    `pip install --target X .` (see
+    app.services.verification.engine._install_python_deps_isolated) must
+    not leak into staged changes or diffs."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        source = _make_source_repo(root)
+        manager = WorkspaceManager(root_dir=root / "workspaces")
+
+        workspace = manager.create_workspace(9, source)
+
+        # Simulate the exact side effect of `pip install --target X .`
+        # running with cwd=workspace.
+        build_pkg = workspace / "build" / "lib" / "ecommerce"
+        build_pkg.mkdir(parents=True)
+        (build_pkg / "__init__.py").write_text("", encoding="utf-8")
+        (build_pkg / "models.py").write_text("X = 1\n", encoding="utf-8")
+
+        egg_info = workspace / "ecommerce_service.egg-info"
+        egg_info.mkdir()
+        (egg_info / "PKG-INFO").write_text("Metadata-Version: 2.1\n", encoding="utf-8")
+        (egg_info / "SOURCES.txt").write_text("setup.py\n", encoding="utf-8")
+        (egg_info / "dependency_links.txt").write_text("\n", encoding="utf-8")
+        (egg_info / "top_level.txt").write_text("ecommerce\n", encoding="utf-8")
+
+        # Legitimate agent fix alongside the artifacts
+        (workspace / "src" / "app.py").write_text("VALUE = 42\n", encoding="utf-8")
+
+        assert GitService.stage_all_changes(workspace) is True
+
+        changed = GitService.get_changed_files(workspace)
+        assert changed == ["src/app.py"]
+
+        diff = GitService.get_workspace_diff(workspace)
+        for banned in ("build/", "egg-info", "PKG-INFO", "SOURCES.txt"):
             assert banned not in diff, f"artifact '{banned}' leaked into diff"
         assert "-VALUE = 1" in diff
         assert "+VALUE = 42" in diff

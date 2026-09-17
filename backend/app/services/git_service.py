@@ -6,7 +6,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import FrozenSet, List, Optional, Tuple
 import git
 
 from app.core.logging import logger
@@ -14,7 +14,23 @@ from app.core.logging import logger
 # Runtime-generated Python/test artifacts. These are pruned from a workspace
 # before staging so they can never enter the persisted review diff, even for
 # workspaces created before per-workspace .gitignore files existed.
-ARTIFACT_DIR_NAMES = {"__pycache__", ".pytest_cache"}
+#
+# ARTIFACT_DIR_NAMES matches directory names exactly (`name in ARTIFACT_DIR_NAMES`).
+# "build", "dist", and ".eggs" are always named exactly that -- same names
+# app.services.workspace_manager.EXCLUDED_DIR_NAMES already treats as
+# disposable when copying a repo into a fresh workspace, applied here to the
+# artifacts a task's own execution (chiefly `pip install --target X .` in
+# app.services.verification.engine._install_python_deps_isolated, which
+# writes build/ and *.egg-info into the CURRENT directory as a normal
+# side effect regardless of --target) generates afterward.
+#
+# *.egg-info is NOT a fixed name -- it's "<distribution-name>.egg-info", a
+# different string per package -- so it cannot go in ARTIFACT_DIR_NAMES (a
+# plain `in` check would never match it). It's matched by fnmatch against
+# ARTIFACT_DIR_PATTERNS instead, mirroring how ARTIFACT_FILE_PATTERNS
+# already fnmatch-matches file names below.
+ARTIFACT_DIR_NAMES = {"__pycache__", ".pytest_cache", "build", "dist", ".eggs"}
+ARTIFACT_DIR_PATTERNS = {"*.egg-info"}
 ARTIFACT_FILE_PATTERNS = {"*.pyc", "*.pyo", ".coverage"}
 
 
@@ -155,29 +171,89 @@ class GitService:
             GitService._close_repo(repo)
 
     @staticmethod
-    def _prune_runtime_artifacts(workspace_dir: Path) -> None:
-        """Delete pytest/bytecode artifacts from the workspace on disk.
+    def _tracked_files_and_root(workspace_dir: Path) -> Tuple[Optional[Path], FrozenSet[str]]:
+        """Resolve the git repository root and the set of tracked file paths
+        (relative to that root, forward-slash-separated, via `git ls-files`)
+        for the repo containing workspace_dir.
 
-        Test runs generate __pycache__ directories, .pyc files, .pytest_cache,
-        and .coverage inside the workspace. Pruning them before staging keeps
-        generated artifacts out of `git add -A` and therefore out of the task
-        diff, regardless of any .gitignore present.
+        Returns (None, frozenset()) if workspace_dir is not inside a git
+        repository -- callers then have nothing to protect and fall back to
+        the pre-existing unconditional-prune behavior for that case.
+        """
+        repo = None
+        try:
+            repo = git.Repo(workspace_dir, search_parent_directories=True)
+            repo_root = Path(repo.working_tree_dir).resolve()
+            output = repo.git.ls_files()
+            tracked = frozenset(output.splitlines()) if output else frozenset()
+            return repo_root, tracked
+        except Exception:
+            return None, frozenset()
+        finally:
+            GitService._close_repo(repo)
+
+    @staticmethod
+    def _is_tracked(rel_path: str, tracked: FrozenSet[str], is_dir: bool) -> bool:
+        """True if `rel_path` (relative to the repo root, forward-slash
+        style) is itself a tracked file, or -- for a directory candidate --
+        git tracks at least one file underneath it. Used so a name merely
+        matching an artifact pattern is never sufficient reason to delete
+        it: only a path git doesn't know about is a generated artifact
+        rather than legitimate, already-committed content."""
+        if is_dir:
+            prefix = rel_path.rstrip("/") + "/"
+            return any(t == rel_path or t.startswith(prefix) for t in tracked)
+        return rel_path in tracked
+
+    @staticmethod
+    def _prune_runtime_artifacts(workspace_dir: Path) -> None:
+        """Delete generated Python/test artifacts from the workspace on disk.
+
+        Test runs generate __pycache__ directories, .pyc files,
+        .pytest_cache, and .coverage; installing a local package (`pip
+        install --target X .`, see
+        app.services.verification.engine._install_python_deps_isolated)
+        generates build/, dist/, .eggs/, and *.egg-info inside the CURRENT
+        directory as a normal side effect, regardless of --target. Pruning
+        all of these before staging keeps them out of `git add -A` and
+        therefore out of the task diff, regardless of any .gitignore
+        present.
+
+        Git-aware: a candidate is only ever deleted if git does not already
+        track it (or, for a directory, does not track anything underneath
+        it) -- a legitimately committed `build/` directory or `.coverage`
+        file is never touched, no matter its name. If workspace_dir isn't
+        inside a git repository at all, there is nothing tracked to protect
+        and every match is pruned, matching the previous behavior.
         """
         root = Path(workspace_dir)
         if not root.is_dir():
             return
 
+        repo_root, tracked = GitService._tracked_files_and_root(root)
+        base = repo_root if repo_root is not None else root.resolve()
+
         for dirpath, dirnames, filenames in os.walk(root):
             for name in list(dirnames):
-                if name in ARTIFACT_DIR_NAMES:
-                    shutil.rmtree(Path(dirpath) / name, ignore_errors=True)
+                if name in ARTIFACT_DIR_NAMES or any(
+                    fnmatch.fnmatch(name, pattern) for pattern in ARTIFACT_DIR_PATTERNS
+                ):
+                    candidate = Path(dirpath) / name
+                    rel = candidate.resolve().relative_to(base).as_posix()
+                    if GitService._is_tracked(rel, tracked, is_dir=True):
+                        continue
+                    shutil.rmtree(candidate, ignore_errors=True)
                     dirnames.remove(name)
             for name in filenames:
                 if any(fnmatch.fnmatch(name, pattern) for pattern in ARTIFACT_FILE_PATTERNS):
+                    candidate = Path(dirpath) / name
+                    rel = candidate.resolve().relative_to(base).as_posix()
+                    if GitService._is_tracked(rel, tracked, is_dir=False):
+                        continue
                     try:
-                        (Path(dirpath) / name).unlink()
+                        candidate.unlink()
                     except OSError as e:
-                        logger.warning(f"Could not prune artifact '{dirpath / name}': {e}")
+                        logger.warning(f"Could not prune artifact '{candidate}': {e}")
 
     @staticmethod
     def stage_all_changes(workspace_dir: Path | str) -> bool:

@@ -197,6 +197,155 @@ def test_stage_all_changes_preserves_legitimate_source_changes():
 
 
 # -------------------------------------------------------------------------
+# Phase 6C: build/ and *.egg-info left behind by `pip install --target X .`
+# (app.services.verification.engine._install_python_deps_isolated) must be
+# pruned exactly like __pycache__/.pytest_cache/.coverage already were.
+# -------------------------------------------------------------------------
+def _create_pip_install_artifacts(ws: Path, package: str = "ecommerce") -> None:
+    """Simulate the build/*.egg-info side effects of
+    `pip install --target <isolated dir> .` run with cwd=<workspace> --
+    --target only controls where the installed package lands, not where the
+    build happens, so building a local source tree still writes build/ and
+    <dist-name>.egg-info/ into the current directory regardless."""
+    build_pkg = ws / "build" / "lib" / package
+    build_pkg.mkdir(parents=True)
+    (build_pkg / "__init__.py").write_text("", encoding="utf-8")
+    (build_pkg / "models.py").write_text("X = 1\n", encoding="utf-8")
+
+    egg_info = ws / f"{package}_service.egg-info"
+    egg_info.mkdir()
+    (egg_info / "PKG-INFO").write_text("Metadata-Version: 2.1\n", encoding="utf-8")
+    (egg_info / "SOURCES.txt").write_text("setup.py\n", encoding="utf-8")
+    (egg_info / "dependency_links.txt").write_text("\n", encoding="utf-8")
+    (egg_info / "top_level.txt").write_text(f"{package}\n", encoding="utf-8")
+
+
+def test_stage_all_changes_excludes_python_build_and_egg_info_artifacts():
+    """Regression test: build/ and *.egg-info left behind by an isolated
+    `pip install --target X .` must never be staged or appear in the review
+    diff, even without any .gitignore."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws = _make_committed_repo(Path(tmpdir))
+        _create_pip_install_artifacts(ws)
+
+        # Legitimate agent change alongside the artifacts
+        (ws / "src" / "app.py").write_text("VALUE = 42\n", encoding="utf-8")
+
+        assert GitService.stage_all_changes(ws) is True
+
+        changed = GitService.get_changed_files(ws)
+        assert changed == ["src/app.py"]
+
+        diff = GitService.get_workspace_diff(ws)
+        for banned in ("build/", "egg-info", "PKG-INFO", "SOURCES.txt"):
+            assert banned not in diff, f"artifact '{banned}' leaked into diff"
+        assert "+VALUE = 42" in diff
+
+        # Artifacts were pruned from disk, so later staging passes stay clean too
+        assert not (ws / "build").exists()
+        assert not (ws / "ecommerce_service.egg-info").exists()
+
+
+def test_stage_all_changes_preserves_tracked_build_directory():
+    """A build/ directory that is legitimately tracked in git (e.g. a
+    committed JS/webpack build output, unrelated to Python packaging) must
+    never be deleted or reported as removed, even though its name matches
+    the artifact-pruning denylist."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        repo_dir = root / "ws_repo"
+        repo_dir.mkdir()
+        (repo_dir / "src").mkdir()
+        (repo_dir / "src" / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+        (repo_dir / "build").mkdir()
+        (repo_dir / "build" / "index.html").write_text("<html></html>\n", encoding="utf-8")
+        with git.Repo.init(repo_dir) as repo:
+            repo.git.add(A=True)
+            repo.index.commit("baseline with a tracked build/ directory")
+
+        (repo_dir / "src" / "app.py").write_text("VALUE = 2\n", encoding="utf-8")
+
+        assert GitService.stage_all_changes(repo_dir) is True
+
+        # The tracked build/ directory must survive untouched.
+        assert (repo_dir / "build" / "index.html").exists()
+        assert (repo_dir / "build" / "index.html").read_text(encoding="utf-8") == "<html></html>\n"
+
+        changed = GitService.get_changed_files(repo_dir)
+        assert changed == ["src/app.py"]
+
+        diff = GitService.get_workspace_diff(repo_dir)
+        assert "build/index.html" not in diff
+        assert "deleted" not in diff.lower()
+
+
+def test_stage_all_changes_preserves_tracked_coverage_file():
+    """Same tracked-content safety guarantee for the pre-existing artifact
+    patterns: a .coverage file that is legitimately tracked in git must
+    never be deleted, even though its name matches the denylist."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        repo_dir = root / "ws_repo"
+        repo_dir.mkdir()
+        (repo_dir / "src").mkdir()
+        (repo_dir / "src" / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+        (repo_dir / ".coverage").write_bytes(b"tracked-coverage-data")
+        with git.Repo.init(repo_dir) as repo:
+            repo.git.add(A=True)
+            repo.index.commit("baseline with a tracked .coverage file")
+
+        (repo_dir / "src" / "app.py").write_text("VALUE = 2\n", encoding="utf-8")
+
+        assert GitService.stage_all_changes(repo_dir) is True
+
+        assert (repo_dir / ".coverage").exists()
+        assert (repo_dir / ".coverage").read_bytes() == b"tracked-coverage-data"
+        changed = GitService.get_changed_files(repo_dir)
+        assert changed == ["src/app.py"]
+
+
+def test_build_and_egg_info_never_enter_changed_files_exact_repro():
+    """Exact regression pin for the live-reproduced bug (Phase 6C audit): a
+    minimal installable Python package (pyproject.toml-shaped, mirroring
+    demo_repo's own 'ecommerce' package) produces exactly
+    build/lib/<package>/*.py and <dist>.egg-info/{PKG-INFO,SOURCES.txt,
+    dependency_links.txt,top_level.txt} when `pip install --target X .` runs
+    with cwd=workspace. None of it may ever appear in changed_files."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ws = _make_committed_repo(Path(tmpdir))
+
+        build_pkg = ws / "build" / "lib" / "ecommerce"
+        build_pkg.mkdir(parents=True)
+        for name in ("__init__.py", "models.py", "order_service.py", "payment_validator.py"):
+            (build_pkg / name).write_text("# generated\n", encoding="utf-8")
+
+        egg_info = ws / "ecommerce_service.egg-info"
+        egg_info.mkdir()
+        (egg_info / "PKG-INFO").write_text("Metadata-Version: 2.1\n", encoding="utf-8")
+        (egg_info / "SOURCES.txt").write_text("setup.py\n", encoding="utf-8")
+        (egg_info / "dependency_links.txt").write_text("\n", encoding="utf-8")
+        (egg_info / "top_level.txt").write_text("ecommerce\n", encoding="utf-8")
+
+        (ws / "src" / "app.py").write_text("VALUE = 42\n", encoding="utf-8")  # the real fix
+
+        assert GitService.stage_all_changes(ws) is True
+
+        changed = GitService.get_changed_files(ws)
+        assert changed == ["src/app.py"]
+        for path in (
+            "build/lib/ecommerce/__init__.py",
+            "build/lib/ecommerce/models.py",
+            "build/lib/ecommerce/order_service.py",
+            "build/lib/ecommerce/payment_validator.py",
+            "ecommerce_service.egg-info/PKG-INFO",
+            "ecommerce_service.egg-info/SOURCES.txt",
+            "ecommerce_service.egg-info/dependency_links.txt",
+            "ecommerce_service.egg-info/top_level.txt",
+        ):
+            assert path not in changed
+
+
+# -------------------------------------------------------------------------
 # Branch / commit helpers (used by the GitHub approval flow)
 # -------------------------------------------------------------------------
 def test_create_branch_forks_from_base_and_checks_it_out():
